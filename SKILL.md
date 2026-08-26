@@ -82,8 +82,7 @@ At member level, `writerMemberInfos[].domainId` classifies each person:
 | other nonzero | external LINE WORKS user (another tenant) |
 
 ```bash
-lineworks channels --members          # classify who has SPOKEN per channel
-lineworks channels --members --sample 200
+lineworks channels --members          # real roster per channel, classified
 ```
 
 **`--members` is a real roster.** `getChannelMembers` returns actual membership

@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-lineworks - agent-native CLI for sending as a LINE WORKS *user account*.
+lineworks - agent-native CLI for LINE WORKS, as your own *user account*.
 
-Zero dependencies (Python 3.8+ stdlib only). Every command supports --json.
+Send text, images, files and stickers to many people and group rooms at once;
+read channel history; list channels with their real member rosters; browse the
+domain directory. Zero dependencies (Python 3.8+ stdlib). Every command
+supports --json.
 
-The LINE WORKS Bot API cannot reach talk rooms containing LINE users or
-external LINE WORKS users, and has no user-as-sender mode at all. This client
-therefore drives the private web-messenger API at talk.worksmobile.com using
-the session cookie from a normal browser login.
+Why not the official API: the Bot API cannot reach talk rooms containing LINE
+users or external LINE WORKS users, and has no user-as-sender mode at all. This
+client drives the private web-messenger API at talk.worksmobile.com with the
+session cookie from a normal browser login. Contacts live on a second service,
+contact.worksmobile.com, with its own auth header.
+
+Sending is deliberately obstructive: --dry-run previews, any unresolved target
+refuses the whole send, ambiguous names are never guessed, --yes is required,
+and --tag makes a run resumable so a crash cannot double-message.
 
   Unofficial. Undocumented, private API - it can break without warning.
-  Sends real messages to real people. See BROADCAST SAFETY below.
+  Sends real messages to real people. Use on your own account only.
 """
 from __future__ import annotations
 
@@ -626,8 +634,7 @@ def fetch_channels(ident, device_id, count=500, days=30, debug=False,
     return fetch_channels_sync(ident, device_id, min(count, 200), days, debug)
 
 
-def channel_members(channel_no, my_domain, sample=None, debug=False,
-                    device_id=None):
+def channel_members(channel_no, my_domain, debug=False, device_id=None):
     """getChannelMembers - the REAL roster, silent members included.
 
     Pages 500 at a time: when a page comes back full, re-request passing the
@@ -680,7 +687,7 @@ def cmd_channels(args):
         for i, c in enumerate(chans):
             try:
                 c["members"] = channel_members(c["channelNo"], my_domain,
-                                               args.sample, args.debug, dev)
+                                               args.debug, dev)
             except Net:
                 c["members"] = None
             if i < len(chans) - 1:
@@ -1274,10 +1281,8 @@ def build_parser():
                    help="use the delta-sync endpoint instead of the full list")
     c.add_argument("--raw", action="store_true", help="unparsed response")
     c.add_argument("--members", action="store_true",
-                   help="classify who has SPOKEN (sample, not a roster; "
-                        "1 request per channel)")
-    c.add_argument("--sample", type=int, default=100,
-                   help="messages to scan per channel for --members")
+                   help="real member roster per channel, classified "
+                        "(1 request per channel)")
     c.set_defaults(fn=cmd_channels)
 
     r = sub.add_parser("raw", parents=[common],
