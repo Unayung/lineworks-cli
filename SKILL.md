@@ -278,6 +278,59 @@ lineworks contacts --json
 - Only the *set* call was observed. Un-starring is presumably `DELETE` on the
   same path, but that is **unverified** - this CLI does not write here at all.
 
+## Sending images and files
+
+```bash
+lineworks send --to "@Jimmy Hsiao" --file ./photo.png --yes
+```
+
+**Two steps, and the upload itself commits the message** - there is no third
+`sendMessage` call:
+
+1. `POST /p/oneapp/client/chat/issueResourcePath` (talk host, raw JSON)
+   `{serviceId:"works", channelNo, filename, filesize, msgType}`
+   -> `{code:200, resourcePath:"/k/oneapp/r/...", fileUuid}`
+2. `POST https://storage.worksmobile.com<resourcePath>?Servicekey=oneapp&writeMode=overwrite&isMakethumbnail=true`
+   multipart body with field `file`; the message metadata rides in **headers**:
+   `X-channelNo`, `X-type`, `X-extras` (JSON), `X-ocn: 1`, `Web-Device-ID`,
+   and `X-serviceId: works`.
+
+Gotchas, each one a failed upload:
+
+- **`X-serviceId: works` is mandatory.** Without it every upload fails with
+  `400 Bad request Key:serviceId EEXIST` - a message that names the wrong
+  problem entirely. It is a header; passing serviceId in the query does nothing.
+- **The storage service uses `code: 0` for success** - the exact opposite of the
+  chat API, where 0 is not success and 200 is. Two services, two conventions.
+- `X-extras` needs `{filesize, filename, resourcepath}`, plus `{width, height}`
+  for an image. The CLI reads dimensions from PNG/JPEG/GIF headers directly.
+- The upload host comes from `window.envData.storageAddress` on the logged-in
+  talk page (`https://storage.worksmobile.com` here). It is per-tenant config,
+  not a constant - re-read it if uploads start 404ing.
+
+`messageTypeCode` (from the bundle's own enum): 1 text, 4 location, 5 bot,
+8/10 rich, **11 image**, 12 audio, 14 video, 15 sticker, **16 file**, 17 team
+note, 18 sticker v3, 22 merge-forward, 26 profile, 27 bot rich, 29 template.
+The CLI picks 11 when it can read image dimensions, else 16.
+
+## Reading the bundle (how the above was found)
+
+`https://talk.worksmobile.com/dist/main-<hash>.js` is served **unauthenticated**
+(~3 MB). It contains the URL builders, the message-type enum and the upload
+flow. The hash changes on deploy; get the current one from the page source. This
+is far cheaper than probing endpoints blind - the contacts service cost 14 wasted
+404s before a capture found it.
+
+Endpoints visible in the bundle but **not yet implemented** here:
+
+| endpoint | why it matters |
+|---|---|
+| `/client/chat/getChannelMembers` | a real channel roster - would replace the `--members` sampling |
+| `/client/chat/getVisibleUserChannelList` | likely a full channel list without the ~30-day sync window |
+| `/client/chat/getUserChannelListByType` | channels filtered by type |
+| `/client/chat/getMessageListByNoList` | fetch specific messages by number |
+| `message/sendMulti` | referenced as a 1-by-1 multi-send link |
+
 ## Escape hatch
 
 ```bash

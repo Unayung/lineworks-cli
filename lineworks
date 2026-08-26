@@ -667,6 +667,10 @@ def channel_directory(ident, device_id, debug=False):
 
 # messageTypeCode, observed live. 1 = typed text, 5 = bot/rich text; the 90s and
 # 100s are cards and membership events that carry their payload in `extras`.
+# messageTypeCode, from the web bundle's own enum
+MSG_TEXT, MSG_LOCATION, MSG_IMAGE, MSG_VIDEO, MSG_FILE = 1, 4, 11, 14, 16
+STORAGE_BASE = "https://storage.worksmobile.com"     # envData.storageAddress
+
 TEXT_TYPES = {1, 5}
 SYSTEM_TYPES = {101, 102}
 
@@ -730,6 +734,18 @@ def cmd_read(args):
         msgs, raw = fetch_messages(t.id, args.count, since, args.debug, dev)
         if args.raw:
             return emit(ok(raw), args.json)
+        for m in msgs:                      # image/file carry no content
+            if not m["content"] and m["type"] in (MSG_IMAGE, MSG_VIDEO, MSG_FILE):
+                try:
+                    x = json.loads(m["extras"] or "{}")
+                    kind = {MSG_IMAGE: "image", MSG_VIDEO: "video"}.get(
+                        m["type"], "file")
+                    dims = (f' {x.get("width")}x{x.get("height")}'
+                            if x.get("width") else "")
+                    m["content"] = (f'[{kind}] {x.get("filename") or "?"}'
+                                    f'{dims} ({x.get("filesize") or "?"}B)')
+                except (ValueError, TypeError):
+                    pass
         shown = msgs if args.all else [m for m in msgs
                                        if m["content"] and not m["is_system"]]
         if args.json and not args.follow:
@@ -747,6 +763,105 @@ def cmd_read(args):
         if msgs:
             since = max(m["messageNo"] or 0 for m in msgs)
         time.sleep(max(args.interval, 5))     # someone else's production service
+
+
+def _image_size(data):
+    """Width/height from PNG, JPEG or GIF headers. stdlib only."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:3] == b"GIF":
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data[:2] == b"\xff\xd8":                       # JPEG: walk the segments
+        i = 2
+        while i < len(data) - 9:
+            if data[i] != 0xFF:
+                i += 1; continue
+            marker, ln = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return (int.from_bytes(data[i + 7:i + 9], "big"),
+                        int.from_bytes(data[i + 5:i + 7], "big"))
+            i += 2 + ln
+    return 0, 0
+
+
+def _multipart(field, filename, data):
+    boundary = "----lineworks" + uuid.uuid4().hex
+    pre = (f"--{boundary}\r\n"
+           f'Content-Disposition: form-data; name="{field}"; '
+           f'filename="{filename}"\r\n'
+           f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+    return (f"multipart/form-data; boundary={boundary}",
+            pre + data + f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+
+def send_file(channel_no, path, ident, device_id, msg_type=None, debug=False):
+    """Two steps, recovered from the web bundle:
+
+       1. POST /p/oneapp/client/chat/issueResourcePath -> resourcePath
+       2. POST <storageAddress><resourcePath>?Servicekey=oneapp&... with the
+          file as multipart, and the message metadata in X-* HEADERS.
+
+    The upload itself commits the message - there is no third sendMessage call.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    name = os.path.basename(path)
+    w, h = _image_size(data)
+    if msg_type is None:
+        msg_type = MSG_IMAGE if w and h else MSG_FILE
+
+    issued, _, _ = request("/p/oneapp/client/chat/issueResourcePath",
+                           {"serviceId": "works", "channelNo": int(channel_no),
+                            "filename": name, "filesize": len(data),
+                            "msgType": msg_type},
+                           JSON_BODY, debug=debug, device_id=device_id)
+    code = int(issued.get("code", 0) or 0)
+    if code != 200 or not issued.get("resourcePath"):
+        raise Net(f'issueResourcePath: code {code} '
+                  f'{issued.get("message") or issued}'.strip())
+    rpath = issued["resourcePath"]
+
+    extras = {"filesize": len(data), "filename": name, "resourcepath": rpath}
+    if msg_type == MSG_IMAGE:
+        extras.update({"width": w, "height": h})
+
+    ctype, body = _multipart("file", name, data)
+    url = (STORAGE_BASE + rpath +
+           "?Servicekey=oneapp&writeMode=overwrite&isMakethumbnail=true")
+    headers = {"Cookie": load_cookie(), "User-Agent": UA,
+               "Accept": "application/json, text/plain, */*",
+               "Content-Type": ctype, "Origin": BASE, "Referer": BASE + "/",
+               "X-channelNo": str(channel_no), "X-type": str(msg_type),
+               "X-extras": json.dumps(extras, ensure_ascii=False),
+               "X-ocn": "1", "Web-Device-ID": device_id,
+               # without this the storage service rejects every upload with
+               # 400 "Bad request Key:serviceId EEXIST"
+               "X-serviceId": "works"}
+    if debug:
+        print(f"--> POST {url}\n    {dict(headers, Cookie='<redacted>')}\n"
+              f"    <{len(body)} bytes>", file=sys.stderr)
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw, status = r.read(), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(), e.code
+    except urllib.error.URLError as e:
+        raise Net(f"upload failed: {e.reason}")
+    text = raw.decode("utf-8-sig", errors="replace")
+    if debug:
+        print(f"<-- {status} {text[:600]}", file=sys.stderr)
+    try:
+        parsed = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        parsed = {"_raw": text[:400]}
+    # NB: the storage service uses code 0 for success - the opposite of the
+    # chat API, where 0 is not a success value and 200 is.
+    ok_upload = status == 200 and int(parsed.get("code", -1)) == 0
+    return {"status": status, "ok": ok_upload, "resourcePath": rpath,
+            "type": msg_type, "filename": name, "size": len(data),
+            "dimensions": [w, h] if w else None, "response": parsed}
 
 
 def send_one(channel_no, text, ident, device_id, debug=False):
@@ -808,9 +923,9 @@ def cmd_targets(args):
 
 
 def cmd_send(args):
-    if not args.message and not args.message_file:
-        return emit(err("no message; use --message or --message-file", EX_USAGE),
-                    args.json)
+    if not args.message and not args.message_file and not args.file:
+        return emit(err("no message; use --message, --message-file or --file",
+                        EX_USAGE), args.json)
     text = args.message
     if args.message_file:
         with open(args.message_file, "r", encoding="utf-8") as f:
@@ -854,7 +969,13 @@ def cmd_send(args):
         if key and already_sent(key):
             skipped.append(t.as_dict()); continue
         try:
-            data, status, tid = send_one(t.id, text, ident, dev, args.debug)
+            if args.file:
+                r = send_file(t.id, args.file, ident, dev, debug=args.debug)
+                data, tid = r["response"], r["resourcePath"]
+                status = 200 if r["ok"] else (r["status"] or 500)
+                data = dict(data, code=200 if r["ok"] else data.get("code", 1))
+            else:
+                data, status, tid = send_one(t.id, text, ident, dev, args.debug)
         except (Net, Auth) as e:
             failed.append(dict(t.as_dict(), error=str(e)))
             if isinstance(e, Auth):
@@ -928,6 +1049,7 @@ def build_parser():
     s = sub.add_parser("send", parents=[common, tgt_flags],
                        help="send one message to many targets")
     s.add_argument("--message", "-m")
+    s.add_argument("--file", help="image/file to send instead of text")
     s.add_argument("--message-file")
     s.add_argument("--delay", type=float, default=3.0,
                    help="seconds between sends (default 3; keep it human)")
