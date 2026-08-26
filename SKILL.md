@@ -8,6 +8,9 @@ description: Send a message as your own LINE WORKS user account to many targets 
 Zero-dependency Python CLI driving the private web-messenger API behind
 `talk.worksmobile.com`, authenticated with a browser session cookie.
 
+**Binary:** `lineworks` if on PATH, else `~/lineworks-cli/lineworks`
+(executable, stdlib only, no venv needed).
+
 **Always pass `--json`** when parsing output. Works before or after the
 subcommand:
 
