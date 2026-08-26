@@ -669,6 +669,10 @@ def channel_directory(ident, device_id, debug=False):
 # 100s are cards and membership events that carry their payload in `extras`.
 # messageTypeCode, from the web bundle's own enum
 MSG_TEXT, MSG_LOCATION, MSG_IMAGE, MSG_VIDEO, MSG_FILE = 1, 4, 11, 14, 16
+MSG_STICKER_V3 = 18
+STICKER_CATALOGUE = ("/p/alice/admin/authapi/v1.0/sticker-categories/v7"
+                     "?suggestScheme=2")
+STICKER_STATIC = BASE + "/p/static/static/wm"
 STORAGE_BASE = "https://storage.worksmobile.com"     # envData.storageAddress
 
 TEXT_TYPES = {1, 5}
@@ -735,6 +739,14 @@ def cmd_read(args):
         if args.raw:
             return emit(ok(raw), args.json)
         for m in msgs:                      # image/file carry no content
+            if not m["content"] and m["type"] == MSG_STICKER_V3:
+                try:
+                    x = json.loads(m["extras"] or "{}")
+                    m["content"] = (f'[sticker] {x.get("pkgId")}:{x.get("stkId")}'
+                                    + (" (broken: stkType must be empty)"
+                                       if x.get("stkType") else ""))
+                except (ValueError, TypeError):
+                    pass
             if not m["content"] and m["type"] in (MSG_IMAGE, MSG_VIDEO, MSG_FILE):
                 try:
                     x = json.loads(m["extras"] or "{}")
@@ -864,6 +876,102 @@ def send_file(channel_no, path, ident, device_id, msg_type=None, debug=False):
             "dimensions": [w, h] if w else None, "response": parsed}
 
 
+def _sticker_base(pkg_ver, is_emoji=False):
+    """Path segments come from the package VERSION, not its id."""
+    o = f"{pkg_ver // 10**6}/{pkg_ver // 10**3}/{pkg_ver % 10**3}"
+    return f'{STICKER_STATIC}/{"emojis" if is_emoji else "stickers"}/{o}'
+
+
+def fetch_sticker_packages(device_id, debug=False):
+    d, st, _ = request(STICKER_CATALOGUE, None, JSON_BODY, "GET",
+                       debug=debug, device_id=device_id)
+    if st != 200:
+        raise Net(f"sticker catalogue: HTTP {st}")
+    out = []
+    for kind in ("stickerPackages", "emojiPackages"):
+        for p in d.get(kind) or []:
+            out.append({"pkgId": p.get("id"), "pkgVer": p.get("version"),
+                        "emoji": kind == "emojiPackages",
+                        "required": p.get("required")})
+    return out
+
+
+def fetch_sticker_package(pkg_id, pkg_ver, is_emoji=False, debug=False):
+    """Package contents are a STATIC json file, not an API call."""
+    url = f"{_sticker_base(pkg_ver, is_emoji)}/{pkg_id}/PC/productInfo.meta"
+    req = urllib.request.Request(url, headers={"Cookie": load_cookie(),
+                                               "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode("utf-8-sig"))
+    except urllib.error.HTTPError as e:
+        raise Net(f"sticker package {pkg_id}: HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise Net(f"sticker package {pkg_id}: {e.reason}")
+    title = (d.get("title") or {}).get("en") or str(pkg_id)
+    return {"pkgId": pkg_id, "pkgVer": pkg_ver, "title": title,
+            "resourceType": d.get("stickerResourceType"),
+            "hasAnimation": bool(d.get("hasAnimation")),
+            "stickers": [s.get("id") for s in d.get("stickers") or []]}
+
+
+def send_sticker(channel_no, pkg_id, pkg_ver, stk_id, ident, device_id,
+                 animated=False, debug=False):
+    """A sticker is an ordinary sendMessage with type 18 - NOT an upload.
+
+    stkType MUST be falsy for a sticker: the client renders the image from
+    `stkType ? "emojis" : "stickers"`, so any truthy value (even "works", which
+    is what EMOJI use) sends a message that arrives as a broken image. The
+    server accepts every value without complaint, so this only shows on screen.
+    """
+    tid = str(random.randint(100_000_000, 999_999_999))
+    extras = {"pkgId": int(pkg_id), "pkgVer": int(pkg_ver),
+              "stkId": str(stk_id), "stkType": "",
+              "stkOpt": "A" if animated else ""}
+    payload = {"serviceId": "works", "channelNo": int(channel_no),
+               "tempMessageId": tid,
+               "caller": {"domainId": ident["domain_id"],
+                          "userNo": ident["user_no"]},
+               "extras": json.dumps(extras, ensure_ascii=False), "content": "",
+               "msgTid": tid, "type": MSG_STICKER_V3}
+    data, status, _ = request("/p/oneapp/client/chat/sendMessage", payload,
+                              FORM_PAYLOAD, debug=debug, device_id=device_id)
+    return data, status, tid
+
+
+def parse_sticker(spec):
+    """'12034:66122838' or '12034/1:66122838' -> (pkgId, pkgVer|None, stkId)"""
+    if ":" not in spec:
+        raise ValueError("sticker must be <pkgId>[/<pkgVer>]:<stkId>")
+    left, stk = spec.split(":", 1)
+    if "/" in left:
+        pkg, ver = left.split("/", 1)
+        return int(pkg), int(ver), stk.strip()
+    return int(left), None, stk.strip()
+
+
+def cmd_stickers(args):
+    ident = whoami(args.debug)
+    dev = _device_id(ident["user_no"])
+    if args.pkg:
+        pkgs = fetch_sticker_packages(dev, args.debug)
+        ver = args.ver or next((p["pkgVer"] for p in pkgs
+                                if p["pkgId"] == args.pkg), 1)
+        emoji = next((p["emoji"] for p in pkgs if p["pkgId"] == args.pkg), False)
+        d = fetch_sticker_package(args.pkg, ver, emoji, args.debug)
+        ids = d["stickers"]
+        return emit(ok(d), args.json,
+                    human=f'{d["title"]}  pkg {d["pkgId"]}/v{d["pkgVer"]}  '
+                          f'{d["resourceType"]}  {len(ids)} stickers\n'
+                          + "\n".join(f'  {args.pkg}:{i}' for i in ids[:args.count]))
+    pkgs = fetch_sticker_packages(dev, args.debug)
+    rows = [f'  {p["pkgId"]:<10} v{str(p["pkgVer"]):<4} '
+            f'{"emoji" if p["emoji"] else "sticker"}' for p in pkgs]
+    return emit(ok({"packages": pkgs, "count": len(pkgs)}), args.json,
+                human=f'{len(pkgs)} packages\n' + "\n".join(rows)
+                      + '\n\nlist one with: stickers --pkg <pkgId>')
+
+
 def send_one(channel_no, text, ident, device_id, debug=False):
     tid = str(random.randint(100_000_000, 999_999_999))   # fresh per message
     payload = {"serviceId": "works", "channelNo": int(channel_no),
@@ -923,9 +1031,9 @@ def cmd_targets(args):
 
 
 def cmd_send(args):
-    if not args.message and not args.message_file and not args.file:
-        return emit(err("no message; use --message, --message-file or --file",
-                        EX_USAGE), args.json)
+    if not (args.message or args.message_file or args.file or args.sticker):
+        return emit(err("no message; use --message, --message-file, --file "
+                        "or --sticker", EX_USAGE), args.json)
     text = args.message
     if args.message_file:
         with open(args.message_file, "r", encoding="utf-8") as f:
@@ -969,7 +1077,15 @@ def cmd_send(args):
         if key and already_sent(key):
             skipped.append(t.as_dict()); continue
         try:
-            if args.file:
+            if args.sticker:
+                pkg, ver, stk = parse_sticker(args.sticker)
+                if ver is None:
+                    ver = next((p["pkgVer"] for p in
+                                fetch_sticker_packages(dev, args.debug)
+                                if p["pkgId"] == pkg), 1)
+                data, status, tid = send_sticker(t.id, pkg, ver, stk, ident,
+                                                 dev, debug=args.debug)
+            elif args.file:
                 r = send_file(t.id, args.file, ident, dev, debug=args.debug)
                 data, tid = r["response"], r["resourcePath"]
                 status = 200 if r["ok"] else (r["status"] or 500)
@@ -1050,6 +1166,8 @@ def build_parser():
                        help="send one message to many targets")
     s.add_argument("--message", "-m")
     s.add_argument("--file", help="image/file to send instead of text")
+    s.add_argument("--sticker",
+                   help="send a sticker: <pkgId>[/<pkgVer>]:<stkId>")
     s.add_argument("--message-file")
     s.add_argument("--delay", type=float, default=3.0,
                    help="seconds between sends (default 3; keep it human)")
@@ -1077,6 +1195,13 @@ def build_parser():
                         help="domain directory; * marks a starred contact")
     ct.add_argument("--starred", action="store_true", help="starred only")
     ct.set_defaults(fn=cmd_contacts)
+
+    sk = sub.add_parser("stickers", parents=[common],
+                        help="list sticker packages, or one package's stickers")
+    sk.add_argument("--pkg", type=int, help="package id to list")
+    sk.add_argument("--ver", type=int, help="package version (looked up if omitted)")
+    sk.add_argument("--count", type=int, default=20)
+    sk.set_defaults(fn=cmd_stickers)
 
     w = sub.add_parser("whoami", parents=[common], help="identity from the session")
     w.set_defaults(fn=cmd_whoami)

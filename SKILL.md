@@ -313,6 +313,40 @@ Gotchas, each one a failed upload:
 note, 18 sticker v3, 22 merge-forward, 26 profile, 27 bot rich, 29 template.
 The CLI picks 11 when it can read image dimensions, else 16.
 
+Files use the same path as images - `send --file` picks type 11 when it can
+read image dimensions (PNG/JPEG/GIF headers) and type 16 otherwise. Both are
+verified working.
+
+## Stickers
+
+**A sticker is NOT an upload.** It is an ordinary `sendMessage` with
+`type: 18` and the sticker identifiers in `extras`:
+
+```json
+{"pkgId":12034,"pkgVer":1,"stkId":"66122838","stkType":"","stkOpt":""}
+```
+
+```bash
+lineworks stickers                       # 28 packages
+lineworks stickers --pkg 12034           # that package's sticker ids
+lineworks send --to "@Someone" --sticker 12034:66122838 --yes
+```
+
+- **`stkType` MUST be empty for a sticker.** The client picks the image URL with
+  `stkType ? "emojis" : "stickers"`, so any truthy value renders a broken image.
+  `"works"` is what EMOJI use - putting it on a sticker looks right in the
+  payload and fails on screen. **The server accepts every value with
+  `code: 200`**, so this is invisible server-side; verified instead by fetching
+  both URLs (`/stickers/...` 200, `/emojis/...` 404).
+- `stkOpt` carries flags; `"A"` means animated (use the animation URL).
+- **Package contents are a static file, not an API**:
+  `/p/static/static/wm/stickers/<v6>/<v3>/<v1>/<pkgId>/PC/productInfo.meta`,
+  where the three path segments derive from the **version**, not the id:
+  `ver//10**6 / ver//10**3 / ver%10**3`. It lists every `stickers[].id`.
+- The package catalogue is
+  `GET /p/alice/admin/authapi/v1.0/sticker-categories/v7?suggestScheme=2`
+  (`stickerPackages` + `emojiPackages`, each with `id` and `version`).
+
 ## Reading the bundle (how the above was found)
 
 `https://talk.worksmobile.com/dist/main-<hash>.js` is served **unauthenticated**
