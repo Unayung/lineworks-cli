@@ -23,6 +23,18 @@ Exit codes: `0` ok - `1` error - `2` usage - `3` auth - `4` network.
 On exit `3` the session expired: log in again in the browser and refresh the
 cookie file. **Do not retry.**
 
+| command | |
+|---|---|
+| `doctor` / `whoami` | session + identity check |
+| `channels` | every channel: type, size, whether it holds LINE users |
+| `channels --members` | real member roster per channel, classified |
+| `targets` | resolve a target list **without sending** - run this first |
+| `send` | text, `--file`, or `--sticker`, to many targets at once |
+| `read` | channel history; `--follow` polls |
+| `contacts` | domain directory; `--starred` for starred contacts |
+| `stickers` | browse sticker packages and their ids |
+| `raw` | any endpoint with auth attached; `--enc` picks the body encoding |
+
 ## Why not the official API
 
 The Bot API cannot do this job, for two documented reasons:
@@ -184,59 +196,74 @@ lineworks send --to-file team.txt -m "Standup moved to 10am" \
 Never pass `--yes` unless the user asked to send that specific message to that
 specific list in that message.
 
-## API map (reverse-engineered)
+### Images and files
 
-Base `https://talk.worksmobile.com`. Required headers are added for you:
-`web-device-id` (`<userNo>-<uuid>`, persisted in `~/.config/lineworks/device`),
-`x-ocn: 11`, `x-request-id`, `device-language`, `x-translate-lang`, Origin,
-Referer.
-
-| endpoint | encoding |
-|---|---|
-| `POST /p/oneapp/client/chat/sendMessage` | form `payload=<json>` |
-| `POST /p/oneapp/client/chat/getReadInfos` | form `payload=<json>` |
-| `POST /p/oneapp/client/chat/getChannelInfo` | form, flat params |
-| `POST /p/oneapp/client/chat/syncUserChannelList` | raw JSON |
-| `POST /p/oneapp/client/chat/getMessageUnreadCountByType` | raw JSON |
-| `GET  /p/contact/v3/domain/contacts/my?<epoch_ms>` | - |
-
-Responses carry their own `code` **in the body**, independent of HTTP status:
-`200` success, `400` bad argument, `2012` updateTime too old. An HTTP 200 with
-body `code: 400` is a failure.
-
-Send payload:
-
-```json
-{"serviceId":"works","channelNo":123456789,"tempMessageId":"987654321",
- "caller":{"domainId":100000001,"userNo":110000000000001},
- "extras":"","content":"hi","msgTid":"987654321","type":1}
+```bash
+lineworks send --to "@Jimmy Hsiao" --file ./photo.png --yes
 ```
 
-## Payload gotchas
+**Two steps, and the upload itself commits the message** - there is no third
+`sendMessage` call:
 
-- **Three body encodings on one API.** form-`payload=<json>`, form-flat, and
-  raw JSON - see the table. Using the wrong one is how you get a 200 that does
-  nothing. `raw --enc json|payload|form` exposes the choice.
-- `tempMessageId` and `msgTid` are **the same value**, a fresh 9-digit number
-  per message. The protocol appears to dedupe on it, so reusing one risks a
-  silently dropped message. `send_one` regenerates per send.
-- `caller` must carry both `domainId` and `userNo` - `whoami` supplies them.
-- Content is `ensure_ascii=False` then urlencoded; CJK round-trips intact.
-- Responses may carry a UTF-8 BOM; decode with `utf-8-sig`.
-- **Body `code` is 200 on success, not 0.** Treating 0 as the success value
-  marks every delivered message as failed.
-- **`syncUserChannelList.updateTime` is a delta cursor, not a list flag.**
-  `0` is rejected outright (`code 400 Invalid updateTime`), and anything past
-  roughly 30-45 days is rejected too (`code 2012 too old`). `fetch_channels`
-  walks the window back (30/21/14/7/1d) until one is accepted. The practical
-  effect: **channels with no recent activity never appear.**
-- Channels arrive in `result[]`; each has `channelNo`, `channelType`, `title`,
-  `userCount`, `botCount`, `joined`. The parser walks for `channelNo` rather
-  than trusting that path.
-- `getChannelInfo` with `recentMessageCount` reads messages back - use it to
-  confirm a send actually landed rather than trusting the 200.
-- DevTools strips `Cookie` from HAR exports - a capture will not contain the
-  credential, and cannot be used to authenticate on its own.
+1. `POST /p/oneapp/client/chat/issueResourcePath` (talk host, raw JSON)
+   `{serviceId:"works", channelNo, filename, filesize, msgType}`
+   -> `{code:200, resourcePath:"/k/oneapp/r/...", fileUuid}`
+2. `POST https://storage.worksmobile.com<resourcePath>?Servicekey=oneapp&writeMode=overwrite&isMakethumbnail=true`
+   multipart body with field `file`; the message metadata rides in **headers**:
+   `X-channelNo`, `X-type`, `X-extras` (JSON), `X-ocn: 1`, `Web-Device-ID`,
+   and `X-serviceId: works`.
+
+Gotchas, each one a failed upload:
+
+- **`X-serviceId: works` is mandatory.** Without it every upload fails with
+  `400 Bad request Key:serviceId EEXIST` - a message that names the wrong
+  problem entirely. It is a header; passing serviceId in the query does nothing.
+- **The storage service uses `code: 0` for success** - the exact opposite of the
+  chat API, where 0 is not success and 200 is. Two services, two conventions.
+- `X-extras` needs `{filesize, filename, resourcepath}`, plus `{width, height}`
+  for an image. The CLI reads dimensions from PNG/JPEG/GIF headers directly.
+- The upload host comes from `window.envData.storageAddress` on the logged-in
+  talk page (`https://storage.worksmobile.com` here). It is per-tenant config,
+  not a constant - re-read it if uploads start 404ing.
+
+`messageTypeCode` (from the bundle's own enum): 1 text, 4 location, 5 bot,
+8/10 rich, **11 image**, 12 audio, 14 video, 15 sticker, **16 file**, 17 team
+note, 18 sticker v3, 22 merge-forward, 26 profile, 27 bot rich, 29 template.
+The CLI picks 11 when it can read image dimensions, else 16.
+
+Files use the same path as images - `send --file` picks type 11 when it can
+read image dimensions (PNG/JPEG/GIF headers) and type 16 otherwise. Both are
+verified working.
+
+### Stickers
+
+**A sticker is NOT an upload.** It is an ordinary `sendMessage` with
+`type: 18` and the sticker identifiers in `extras`:
+
+```json
+{"pkgId":12034,"pkgVer":1,"stkId":"66122838","stkType":"","stkOpt":""}
+```
+
+```bash
+lineworks stickers                       # 28 packages
+lineworks stickers --pkg 12034           # that package's sticker ids
+lineworks send --to "@Someone" --sticker 12034:66122838 --yes
+```
+
+- **`stkType` MUST be empty for a sticker.** The client picks the image URL with
+  `stkType ? "emojis" : "stickers"`, so any truthy value renders a broken image.
+  `"works"` is what EMOJI use - putting it on a sticker looks right in the
+  payload and fails on screen. **The server accepts every value with
+  `code: 200`**, so this is invisible server-side; verified instead by fetching
+  both URLs (`/stickers/...` 200, `/emojis/...` 404).
+- `stkOpt` carries flags; `"A"` means animated (use the animation URL).
+- **Package contents are a static file, not an API**:
+  `/p/static/static/wm/stickers/<v6>/<v3>/<v1>/<pkgId>/PC/productInfo.meta`,
+  where the three path segments derive from the **version**, not the id:
+  `ver//10**6 / ver//10**3 / ver%10**3`. It lists every `stickers[].id`.
+- The package catalogue is
+  `GET /p/alice/admin/authapi/v1.0/sticker-categories/v7?suggestScheme=2`
+  (`stickerPackages` + `emojiPackages`, each with `id` and `version`).
 
 ## Reading
 
@@ -293,74 +320,59 @@ lineworks contacts --json
 - Only the *set* call was observed. Un-starring is presumably `DELETE` on the
   same path, but that is **unverified** - this CLI does not write here at all.
 
-## Sending images and files
+## API map (reverse-engineered)
 
-```bash
-lineworks send --to "@Jimmy Hsiao" --file ./photo.png --yes
-```
+Base `https://talk.worksmobile.com`. Required headers are added for you:
+`web-device-id` (`<userNo>-<uuid>`, persisted in `~/.config/lineworks/device`),
+`x-ocn: 11`, `x-request-id`, `device-language`, `x-translate-lang`, Origin,
+Referer.
 
-**Two steps, and the upload itself commits the message** - there is no third
-`sendMessage` call:
+| endpoint | encoding |
+|---|---|
+| `POST /p/oneapp/client/chat/sendMessage` | form `payload=<json>` |
+| `POST /p/oneapp/client/chat/getReadInfos` | form `payload=<json>` |
+| `POST /p/oneapp/client/chat/getChannelInfo` | form, flat params |
+| `POST /p/oneapp/client/chat/syncUserChannelList` | raw JSON |
+| `POST /p/oneapp/client/chat/getMessageUnreadCountByType` | raw JSON |
+| `GET  /p/contact/v3/domain/contacts/my?<epoch_ms>` | - |
 
-1. `POST /p/oneapp/client/chat/issueResourcePath` (talk host, raw JSON)
-   `{serviceId:"works", channelNo, filename, filesize, msgType}`
-   -> `{code:200, resourcePath:"/k/oneapp/r/...", fileUuid}`
-2. `POST https://storage.worksmobile.com<resourcePath>?Servicekey=oneapp&writeMode=overwrite&isMakethumbnail=true`
-   multipart body with field `file`; the message metadata rides in **headers**:
-   `X-channelNo`, `X-type`, `X-extras` (JSON), `X-ocn: 1`, `Web-Device-ID`,
-   and `X-serviceId: works`.
+Responses carry their own `code` **in the body**, independent of HTTP status:
+`200` success, `400` bad argument, `2012` updateTime too old. An HTTP 200 with
+body `code: 400` is a failure.
 
-Gotchas, each one a failed upload:
-
-- **`X-serviceId: works` is mandatory.** Without it every upload fails with
-  `400 Bad request Key:serviceId EEXIST` - a message that names the wrong
-  problem entirely. It is a header; passing serviceId in the query does nothing.
-- **The storage service uses `code: 0` for success** - the exact opposite of the
-  chat API, where 0 is not success and 200 is. Two services, two conventions.
-- `X-extras` needs `{filesize, filename, resourcepath}`, plus `{width, height}`
-  for an image. The CLI reads dimensions from PNG/JPEG/GIF headers directly.
-- The upload host comes from `window.envData.storageAddress` on the logged-in
-  talk page (`https://storage.worksmobile.com` here). It is per-tenant config,
-  not a constant - re-read it if uploads start 404ing.
-
-`messageTypeCode` (from the bundle's own enum): 1 text, 4 location, 5 bot,
-8/10 rich, **11 image**, 12 audio, 14 video, 15 sticker, **16 file**, 17 team
-note, 18 sticker v3, 22 merge-forward, 26 profile, 27 bot rich, 29 template.
-The CLI picks 11 when it can read image dimensions, else 16.
-
-Files use the same path as images - `send --file` picks type 11 when it can
-read image dimensions (PNG/JPEG/GIF headers) and type 16 otherwise. Both are
-verified working.
-
-## Stickers
-
-**A sticker is NOT an upload.** It is an ordinary `sendMessage` with
-`type: 18` and the sticker identifiers in `extras`:
+Send payload:
 
 ```json
-{"pkgId":12034,"pkgVer":1,"stkId":"66122838","stkType":"","stkOpt":""}
+{"serviceId":"works","channelNo":123456789,"tempMessageId":"987654321",
+ "caller":{"domainId":100000001,"userNo":110000000000001},
+ "extras":"","content":"hi","msgTid":"987654321","type":1}
 ```
 
-```bash
-lineworks stickers                       # 28 packages
-lineworks stickers --pkg 12034           # that package's sticker ids
-lineworks send --to "@Someone" --sticker 12034:66122838 --yes
-```
+## Payload gotchas
 
-- **`stkType` MUST be empty for a sticker.** The client picks the image URL with
-  `stkType ? "emojis" : "stickers"`, so any truthy value renders a broken image.
-  `"works"` is what EMOJI use - putting it on a sticker looks right in the
-  payload and fails on screen. **The server accepts every value with
-  `code: 200`**, so this is invisible server-side; verified instead by fetching
-  both URLs (`/stickers/...` 200, `/emojis/...` 404).
-- `stkOpt` carries flags; `"A"` means animated (use the animation URL).
-- **Package contents are a static file, not an API**:
-  `/p/static/static/wm/stickers/<v6>/<v3>/<v1>/<pkgId>/PC/productInfo.meta`,
-  where the three path segments derive from the **version**, not the id:
-  `ver//10**6 / ver//10**3 / ver%10**3`. It lists every `stickers[].id`.
-- The package catalogue is
-  `GET /p/alice/admin/authapi/v1.0/sticker-categories/v7?suggestScheme=2`
-  (`stickerPackages` + `emojiPackages`, each with `id` and `version`).
+- **Three body encodings on one API.** form-`payload=<json>`, form-flat, and
+  raw JSON - see the table. Using the wrong one is how you get a 200 that does
+  nothing. `raw --enc json|payload|form` exposes the choice.
+- `tempMessageId` and `msgTid` are **the same value**, a fresh 9-digit number
+  per message. The protocol appears to dedupe on it, so reusing one risks a
+  silently dropped message. `send_one` regenerates per send.
+- `caller` must carry both `domainId` and `userNo` - `whoami` supplies them.
+- Content is `ensure_ascii=False` then urlencoded; CJK round-trips intact.
+- Responses may carry a UTF-8 BOM; decode with `utf-8-sig`.
+- **Body `code` is 200 on success, not 0.** Treating 0 as the success value
+  marks every delivered message as failed.
+- **`syncUserChannelList.updateTime` is a delta cursor, not a list flag.**
+  `0` is rejected outright (`code 400 Invalid updateTime`), and anything past
+  roughly 30-45 days is rejected too (`code 2012 too old`). `fetch_channels`
+  walks the window back (30/21/14/7/1d) until one is accepted. The practical
+  effect: **channels with no recent activity never appear.**
+- Channels arrive in `result[]`; each has `channelNo`, `channelType`, `title`,
+  `userCount`, `botCount`, `joined`. The parser walks for `channelNo` rather
+  than trusting that path.
+- `getChannelInfo` with `recentMessageCount` reads messages back - use it to
+  confirm a send actually landed rather than trusting the 200.
+- DevTools strips `Cookie` from HAR exports - a capture will not contain the
+  credential, and cannot be used to authenticate on its own.
 
 ## Reading the bundle (how the above was found)
 
