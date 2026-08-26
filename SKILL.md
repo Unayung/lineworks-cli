@@ -174,10 +174,6 @@ Send payload:
 - `caller` must carry both `domainId` and `userNo` - `whoami` supplies them.
 - Content is `ensure_ascii=False` then urlencoded; CJK round-trips intact.
 - Responses may carry a UTF-8 BOM; decode with `utf-8-sig`.
-- `syncUserChannelList`'s response shape is **unverified** (the capture omitted
-  response bodies). The parser walks the tree for any dict with `channelNo`
-  rather than assuming a path, and falls back to raw. If `channels` looks thin,
-  check `channels --raw --json` and widen it.
 - **Body `code` is 200 on success, not 0.** Treating 0 as the success value
   marks every delivered message as failed.
 - **`syncUserChannelList.updateTime` is a delta cursor, not a list flag.**
