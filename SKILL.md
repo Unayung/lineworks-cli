@@ -1,6 +1,6 @@
 ---
 name: lineworks
-description: Send a message as your own LINE WORKS user account to many targets at once - a mixed list of people and group talk rooms, including rooms containing external LINE users that bots cannot reach. Resolve a target list, preview the plan, then broadcast with rate limiting and resume-safe idempotency. Use whenever the user wants to send the same LINE WORKS message to multiple recipients.
+description: Drive LINE WORKS messaging as your own user account - send text, images, files or stickers to many people and group rooms at once (including rooms with external LINE users, which bots cannot reach), read channel history, list channels with their real member rosters, and browse the domain directory with starred contacts. Use whenever the user wants to send, broadcast, or read LINE WORKS messages, or inspect their LINE WORKS channels, members or contacts.
 ---
 
 # lineworks

@@ -1,14 +1,15 @@
 # lineworks
 
-Command-line control of LINE WORKS messaging — send one message to a whole list
-of people and group rooms, and read channels back, without touching the web UI.
+Command-line control of LINE WORKS messaging — send text, images, files or
+stickers to a whole list of people and group rooms, and read channels back,
+without touching the web UI.
 
 Zero dependencies. Python 3.8+. Single file.
 
 > **Unofficial.** Not affiliated with, endorsed by, or supported by LINE WORKS /
 > NAVER WORKS / Works Mobile. This is an independent client built by reading the
-> web messenger's own network traffic. The API it talks to is undocumented and
-> private, so it can break without warning.
+> web messenger's own JavaScript bundle and network traffic. The API it talks to
+> is undocumented and private, so it can break without warning.
 >
 > Use it on **your own account only**, at human request rates, and check LINE
 > WORKS' terms of service and your own organisation's IT policy before you do —
@@ -54,6 +55,20 @@ lineworks doctor        # confirms the session and prints your identity
 `LINEWORKS_COOKIE` overrides the file. The cookie is never printed. Exit code
 `3` means the session expired — log in again and refresh the file.
 
+## Commands
+
+| | |
+|---|---|
+| `doctor` / `whoami` | session check; identity comes from response headers |
+| `channels` | every channel, with type, size and whether it holds LINE users |
+| `channels --members` | real member roster per channel, classified |
+| `targets` | resolve a target list without sending |
+| `send` | text, `--file`, or `--sticker`, to many targets at once |
+| `read` | channel history, `--follow` to poll |
+| `contacts` | domain directory; `--starred` for starred contacts |
+| `stickers` | browse sticker packages and their ids |
+| `raw` | call any endpoint with auth attached |
+
 ## Quick start
 
 ```bash
@@ -61,6 +76,9 @@ lineworks channels                              # your targets
 lineworks targets --to-file team.txt            # resolve, send nothing
 lineworks send --to-file team.txt -m "..." --dry-run
 lineworks send --to-file team.txt -m "..." --tag notice-1 --yes
+
+lineworks send --to "@Alice Chen" --file ./photo.png --yes
+lineworks send --to "@Alice Chen" --sticker 12034:66122838 --yes
 
 lineworks read --to "#Project Kickoff" --count 50
 lineworks read --to "#Project Kickoff" --follow
@@ -75,6 +93,17 @@ c:123456789          raw channelNo
 123456789            bare digits are always a channelNo
 // comment
 ```
+
+## Everything is a channel
+
+A 1:1 chat and a group room are both just a `channelNo` — there is no separate
+person-vs-group endpoint. **You can only send where a channel already exists**;
+someone you have never messaged resolves as `notfound`. Open the chat once in
+the web UI first.
+
+`channels` distinguishes rooms containing consumer LINE users (marked `LINE`)
+from purely internal ones, and `--members` classifies each member as a LINE
+user, one of your colleagues, or someone from another LINE WORKS tenant.
 
 ## Safety
 
@@ -92,8 +121,10 @@ Broadcasts reach real people, so the defaults are deliberately obstructive:
 
 ## Docs
 
-`SKILL.md` carries the full reverse-engineered API map, the `channelType` table,
-and every payload gotcha that cost a failed request.
+`SKILL.md` carries the full reverse-engineered API map — the three body
+encodings, the `channelType` and `messageTypeCode` tables, the image/file upload
+flow, the sticker payload, and every gotcha that cost a failed request. It also
+doubles as an agent skill file.
 
 ## License
 
