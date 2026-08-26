@@ -414,6 +414,40 @@ def _walk_channels(node, out, depth=0):
 CH_DIRECT, CH_SELF, CH_EXTERNAL = 1, 8, 10
 CHANNEL_KIND = {CH_DIRECT: PERSON, CH_SELF: "self"}
 
+# Where a room's members come from. channelExtras.serviceType == "line" marks a
+# LINE-connected room; localTenants lists other LINE WORKS tenants (always empty
+# in observed data, so the "works-ext" case is INFERRED, not confirmed).
+ORIGIN_LINE, ORIGIN_WORKS_EXT, ORIGIN_INTERNAL = "line", "works-ext", "internal"
+
+
+def _channel_extras(c):
+    raw = c.get("channelExtras")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def _channel_origin(extras):
+    if (extras.get("serviceType") or "").lower() == "line":
+        return ORIGIN_LINE
+    lt = extras.get("localTenants")
+    if lt and lt not in ("[]", []):
+        return ORIGIN_WORKS_EXT
+    return ORIGIN_INTERNAL
+
+
+def classify_member(m, my_domain):
+    """domainId 0 = consumer LINE user; == mine = colleague; else other tenant."""
+    d = m.get("domainId")
+    if d in (0, "0", None, ""):
+        return "line"
+    if str(d) == str(my_domain):
+        return "internal"
+    return "works-ext"
+
 
 def fetch_channels(ident, device_id, count=200, days=30, debug=False):
     """syncUserChannelList is a DELTA SYNC, not a list call.
@@ -457,12 +491,42 @@ def fetch_channels(ident, device_id, count=200, days=30, debug=False):
         ctype = c.get("channelType")
         users = c.get("userCount")
         kind = CHANNEL_KIND.get(ctype, GROUP)
+        extras = _channel_extras(c)
+        origin = _channel_origin(extras)
         chans.append({"channelNo": no, "title": (c.get("title") or "").strip(),
                       "member_count": users, "bot_count": c.get("botCount"),
                       "channel_type": ctype, "external": ctype == CH_EXTERNAL,
+                      "origin": origin, "has_line_users": origin == ORIGIN_LINE,
                       "kind": kind, "window_days": attempts[-1]})
     chans.sort(key=lambda c: (-(c["member_count"] or 0), c["title"]))
     return chans, data
+
+
+def channel_members(channel_no, my_domain, sample=100, debug=False,
+                    device_id=None):
+    """Classify who has SPOKEN in a channel - this is a sample, not a roster.
+
+    There is no roster endpoint: `userList` stays empty for group channels
+    whatever `userInfoCount` is set to, and `readInfos` carries userNos with no
+    domainId to classify by. So identities come from writerMemberInfos over a
+    window of messages, and a lurker who never posted will not appear.
+    """
+    data, _, _ = request("/p/oneapp/client/chat/getChannelInfo",
+                         {"channelNo": int(channel_no), "direction": 0,
+                          "messageNo": 0, "recentMessageCount": int(sample)},
+                         FORM_FLAT, debug=debug, device_id=device_id)
+    roster = len(data.get("readInfos") or [])
+    seen, out = set(), []
+    for m in (data.get("recentMessage") or {}).get("writerMemberInfos") or []:
+        u = m.get("userNo")
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append({"userNo": u, "name": m.get("name"),
+                    "domainId": m.get("domainId"),
+                    "domain": m.get("domainName") or None,
+                    "origin": classify_member(m, my_domain)})
+    return {"observed": out, "roster_size": roster}
 
 
 def cmd_channels(args):
@@ -474,10 +538,33 @@ def cmd_channels(args):
     if not chans:
         return emit(err("no channels in the sync window", EX_ERR, count=0),
                     args.json)
-    rows = [f'{c["channelNo"]:<12} {c["kind"]:<6} t{c["channel_type"]:<3}'
-            f' {c["member_count"] or "?":>3}u'
-            f' {"EXT" if c["external"] else "   "}  {c["title"] or "(untitled)"}'
-            for c in chans]
+    if args.members:
+        my_domain = ident["domain_id"]
+        for i, c in enumerate(chans):
+            try:
+                c["members"] = channel_members(c["channelNo"], my_domain,
+                                               args.sample, args.debug, dev)
+            except Net:
+                c["members"] = None
+            if i < len(chans) - 1:
+                time.sleep(1)          # one call per channel; stay polite
+
+    tag = {ORIGIN_LINE: "LINE", ORIGIN_WORKS_EXT: "WORKS-EXT",
+           ORIGIN_INTERNAL: ""}
+    rows = []
+    for c in chans:
+        row = (f'{c["channelNo"]:<12} {c["kind"]:<6} t{c["channel_type"]:<3}'
+               f' {c["member_count"] or "?":>3}u {tag[c["origin"]]:<9}'
+               f' {c["title"] or "(untitled)"}')
+        mem = c.get("members")
+        if mem and mem["observed"]:
+            n = {}
+            for m in mem["observed"]:
+                n[m["origin"]] = n.get(m["origin"], 0) + 1
+            got, tot = len(mem["observed"]), c["member_count"] or "?"
+            row += (f'  [spoke {got}/{tot}: '
+                    + ", ".join(f"{k} {v}" for k, v in sorted(n.items())) + "]")
+        rows.append(row)
     note = (f'\n\n{len(chans)} channels active in the last '
             f'{chans[0]["window_days"]}d - dormant ones are NOT listed')
     return emit(ok({"channels": chans, "count": len(chans)}), args.json,
@@ -791,6 +878,11 @@ def build_parser():
     c.add_argument("--days", type=int, default=30,
                    help="sync window; server rejects much past ~30-45")
     c.add_argument("--raw", action="store_true", help="unparsed response")
+    c.add_argument("--members", action="store_true",
+                   help="classify who has SPOKEN (sample, not a roster; "
+                        "1 request per channel)")
+    c.add_argument("--sample", type=int, default=100,
+                   help="messages to scan per channel for --members")
     c.set_defaults(fn=cmd_channels)
 
     r = sub.add_parser("raw", parents=[common],

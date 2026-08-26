@@ -61,8 +61,39 @@ both a `channelNo`, sent through the same call. The kind only affects display.
 |---|---|
 | 1 | 1:1 direct chat |
 | 8 | memo-to-self (excluded from broadcasts) |
-| 10 | **external / cross-tenant room** - the ones bots cannot reach |
-| 2, 3, 4, 5 | internal group rooms of various flavours |
+| 2, 3, 4, 5, 6, 10 | group rooms of various flavours |
+
+**Do not use `channelType` to detect external rooms.** Most LINE-connected rooms
+are type 10, but not all - a type 6 room was observed carrying a LINE user. Use
+`channelExtras` instead:
+
+| signal | meaning |
+|---|---|
+| `channelExtras.serviceType == "line"` | LINE-connected room (`LINE` column) |
+| `channelExtras.localTenants` non-empty | other LINE WORKS tenants (INFERRED - always `[]` in observed data) |
+| neither, plus `domainId`/`orgId` | internal room |
+
+At member level, `writerMemberInfos[].domainId` classifies each person:
+
+| domainId | who |
+|---|---|
+| `0` | **consumer LINE user** (no `domainName`) |
+| == your `domainId` | your own colleague |
+| other nonzero | external LINE WORKS user (another tenant) |
+
+```bash
+lineworks channels --members          # classify who has SPOKEN per channel
+lineworks channels --members --sample 200
+```
+
+**`--members` is a sample, not a roster.** There is no roster endpoint:
+`userList` stays empty for group channels whatever `userInfoCount` is set to,
+and `readInfos` gives userNos with no domainId to classify by. Identities come
+from writers over a window of messages, so a lurker who never posted will not
+appear - hence the `spoke 4/16` framing. It costs one request per channel.
+
+Note that in a LINE-connected room **your own userNo is a per-service alias**,
+not the `userNo` that `whoami` reports.
 
 **Two hard limits on who you can reach:**
 
