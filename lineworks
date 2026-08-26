@@ -26,7 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "https://talk.worksmobile.com"          # confirmed live; paths pending HAR
+BASE = "https://talk.worksmobile.com"
+CONTACT_BASE = "https://contact.worksmobile.com"   # separate service, own auth
 CONFIG_DIR = os.path.expanduser("~/.config/lineworks")
 COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
 SENTLOG = os.path.join(CONFIG_DIR, "sent.jsonl")
@@ -179,6 +180,87 @@ def request(path, body=None, encoding=JSON_BODY, method="POST",
     except json.JSONDecodeError:
         parsed = {"_raw": text}
     return parsed, status, rhdrs
+
+
+def contact_request(path, body=None, method="POST", debug=False):
+    """The contacts service is a DIFFERENT host with its own conventions.
+
+    Same session cookie, but it wants an `x-xsrf-token` header. The web client
+    generates a fresh UUID per call and the server accepts any well-formed one,
+    so there is nothing to harvest from the cookie.
+    """
+    cookie = load_cookie()
+    if not cookie:
+        raise Auth(f"no session cookie. write it to {COOKIE_FILE} (chmod 600) "
+                   f"or set LINEWORKS_COOKIE")
+    url = CONTACT_BASE + path
+    headers = {"Cookie": cookie, "User-Agent": UA,
+               "Accept": "application/json, text/plain, */*",
+               "Origin": CONTACT_BASE, "Referer": CONTACT_BASE + "/p/web/",
+               "x-xsrf-token": str(uuid.uuid4())}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    if debug:
+        print(f"--> {method} {url}\n    {dict(headers, Cookie='<redacted>')}\n"
+              f"    {data!r}", file=sys.stderr)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw, status = r.read(), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(), e.code
+    except urllib.error.URLError as e:
+        raise Net(f"cannot reach {url}: {e.reason}")
+    text = raw.decode("utf-8-sig", errors="replace")
+    if debug:
+        print(f"<-- {status} {text[:1000]}", file=sys.stderr)
+    if status in (401, 403):
+        raise Auth("session cookie rejected by the contacts service")
+    if not text.strip():
+        return {}, status
+    try:
+        return json.loads(text), status
+    except json.JSONDecodeError:
+        return {"_raw": text}, status
+
+
+def fetch_contacts(ident, debug=False, limit=500):
+    """All domain users. Omitting orgUnitId returns the whole domain.
+
+    NOTE: filter={"important": true} is IGNORED by the server - it returns
+    everyone regardless, so starred-only filtering happens client-side.
+    """
+    d, st = contact_request("/v2/api/search",
+                            {"type": "USER", "page": 1, "maxResults": limit,
+                             "filter": {}, "domainId": str(ident["domain_id"])},
+                            debug=debug)
+    if st != 200:
+        raise Net(f"contacts search failed: HTTP {st}")
+    out = []
+    for u in d.get("results") or []:
+        out.append({"id": u.get("id"), "name": u.get("name"),
+                    "email": u.get("email"),
+                    "starred": bool(u.get("important")),
+                    "org": u.get("orgUnitName") or u.get("organizationName"),
+                    "position": u.get("positionName") or None})
+    out.sort(key=lambda c: (not c["starred"], c["name"] or ""))
+    return out, d.get("totalCount")
+
+
+def cmd_contacts(args):
+    ident = whoami(args.debug)
+    people, total = fetch_contacts(ident, args.debug)
+    if args.starred:
+        people = [c for c in people if c["starred"]]
+    if not people:
+        return emit(err("no contacts matched", EX_ERR, total=total), args.json)
+    rows = [f'{"*" if c["starred"] else " "} {str(c["id"]):<18} {c["name"] or "":<14}'
+            f' {c["org"] or "":<12} {c["email"] or ""}' for c in people]
+    note = f'\n\n{len(people)} shown of {total} in the domain'
+    return emit(ok({"contacts": people, "shown": len(people), "total": total}),
+                args.json, human="\n".join(rows) + note)
 
 
 def whoami(debug=False):
@@ -868,6 +950,11 @@ def build_parser():
     rd.add_argument("--interval", type=float, default=15.0)
     rd.add_argument("--raw", action="store_true")
     rd.set_defaults(fn=cmd_read)
+
+    ct = sub.add_parser("contacts", parents=[common],
+                        help="domain directory; * marks a starred contact")
+    ct.add_argument("--starred", action="store_true", help="starred only")
+    ct.set_defaults(fn=cmd_contacts)
 
     w = sub.add_parser("whoami", parents=[common], help="identity from the session")
     w.set_defaults(fn=cmd_whoami)

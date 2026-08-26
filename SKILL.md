@@ -86,11 +86,14 @@ lineworks channels --members          # classify who has SPOKEN per channel
 lineworks channels --members --sample 200
 ```
 
-**`--members` is a sample, not a roster.** There is no roster endpoint:
+**`--members` is a sample, not a roster.** No *channel* roster is reachable:
 `userList` stays empty for group channels whatever `userInfoCount` is set to,
 and `readInfos` gives userNos with no domainId to classify by. Identities come
 from writers over a window of messages, so a lurker who never posted will not
 appear - hence the `spoke 4/16` framing. It costs one request per channel.
+
+(A *domain* roster does exist - see **Contacts** below - but it covers only
+internal colleagues, so it cannot classify a channel's external members.)
 
 Note that in a LINE-connected room **your own userNo is a per-service alias**,
 not the `userNo` that `whoami` reports.
@@ -243,6 +246,37 @@ lineworks read --to "#CS team" --json
   name - a known gap, not a parse failure.
 - `readInfos[]` (userNo, join, readMsgs) and `largestReadMsgNo` are in the same
   response - read receipts are available but not yet surfaced as a command.
+
+## Contacts (a second service)
+
+The contacts directory lives on **`contact.worksmobile.com`**, not the talk
+host - guessing contact paths under `talk.worksmobile.com` returns 404 forever.
+Same session cookie, but it wants an `x-xsrf-token` header; the web client
+generates a fresh UUID per call and the server accepts any well-formed one, so
+there is nothing to harvest from the cookie.
+
+```bash
+lineworks contacts            # whole domain; * marks a starred contact
+lineworks contacts --starred  # starred only
+lineworks contacts --json
+```
+
+| endpoint | notes |
+|---|---|
+| `POST /v2/api/search` | `{"type":"USER","page":1,"maxResults":N,"filter":{},"domainId":"..."}` |
+| `POST /v2/api/domain/users/{userNo}/important` | **sets** starred (empty body, 204) |
+| `GET /v2/api/domains/{d}/orgunits/{o}/forHeader` | org unit header info |
+
+- **"Starred" is `important`** in the API. The UI function is
+  `updateImportantDomainUser`. Each search result carries `important: bool`.
+- **Omit `orgUnitId` to get the whole domain**; pass one (with
+  `includedSubOrgUnit`) to scope to an org unit.
+- **`filter: {"important": true}` is IGNORED** - the server returns every user
+  regardless, so `--starred` filters client-side. Do not trust that filter.
+- A contact's `id` matches the channel's `userList[].mappingContactNos`, which
+  is the join between a chat and a directory entry.
+- Only the *set* call was observed. Un-starring is presumably `DELETE` on the
+  same path, but that is **unverified** - this CLI does not write here at all.
 
 ## Escape hatch
 
