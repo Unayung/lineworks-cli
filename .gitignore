@@ -1,0 +1,7 @@
+*.har
+cookie
+device
+sent.jsonl
+directory.json
+__pycache__/
+*.pyc

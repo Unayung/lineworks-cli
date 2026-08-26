@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+"""
+lineworks - agent-native CLI for sending as a LINE WORKS *user account*.
+
+Zero dependencies (Python 3.8+ stdlib only). Every command supports --json.
+
+The LINE WORKS Bot API cannot reach talk rooms containing LINE users or
+external LINE WORKS users, and has no user-as-sender mode at all. This client
+therefore drives the private web-messenger API at talk.worksmobile.com using
+the session cookie from a normal browser login.
+
+  Unofficial. Undocumented, private API - it can break without warning.
+  Sends real messages to real people. See BROADCAST SAFETY below.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import datetime as _dt
+import sys
+import time
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://talk.worksmobile.com"          # confirmed live; paths pending HAR
+CONFIG_DIR = os.path.expanduser("~/.config/lineworks")
+COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
+SENTLOG = os.path.join(CONFIG_DIR, "sent.jsonl")
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code,
+                                   "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human if human is not None else
+              json.dumps(payload["data"], ensure_ascii=False, indent=2))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+# ------------------------------------------------------------------- auth
+def load_cookie():
+    """Cookie from env, else ~/.config/lineworks/cookie. Never printed."""
+    env = os.environ.get("LINEWORKS_COOKIE")
+    if env:
+        return env.strip()
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            c = f.read().strip()
+    except FileNotFoundError:
+        return None
+    return c or None
+
+
+def check_cookie_perms():
+    """A session cookie is a credential; refuse to use a world-readable one."""
+    if os.environ.get("LINEWORKS_COOKIE"):
+        return None
+    try:
+        mode = os.stat(COOKIE_FILE).st_mode & 0o777
+    except FileNotFoundError:
+        return None
+    if mode & 0o077:
+        return (f"{COOKIE_FILE} is mode {mode:o}; others can read your session. "
+                f"fix with: chmod 600 {COOKIE_FILE}")
+    return None
+
+
+# -------------------------------------------------------------- transport
+# The web client speaks THREE body encodings on the same API. Getting this
+# wrong is the difference between a 200 and a silent no-op:
+#   form + payload=<json>   sendMessage, getReadInfos
+#   form + flat params      getChannelInfo
+#   raw json body           syncUserChannelList, getMessageUnreadCountByType
+FORM_PAYLOAD, FORM_FLAT, JSON_BODY = "form_payload", "form_flat", "json_body"
+
+
+def _device_id(user_no):
+    """web-device-id is '<userNo>-<uuid>'. Stable per install, so persist it."""
+    path = os.path.join(CONFIG_DIR, "device")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = f.read().strip()
+            if d:
+                return d
+    except FileNotFoundError:
+        pass
+    d = f"{user_no}-{uuid.uuid4()}"
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(d)
+    return d
+
+
+_seq = [0]
+
+
+def request(path, body=None, encoding=JSON_BODY, method="POST",
+            debug=False, timeout=20, device_id=None):
+    cookie = load_cookie()
+    if not cookie:
+        raise Auth(f"no session cookie. write it to {COOKIE_FILE} (chmod 600) "
+                   f"or set LINEWORKS_COOKIE")
+
+    url = path if path.startswith("http") else BASE + path
+    now_ms = int(time.time() * 1000)
+    _seq[0] += 1
+    dev = device_id or "unknown"
+
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": BASE,
+        "Referer": BASE + "/",
+        "device-language": "zh_TW",
+        "x-translate-lang": "zh-TW",
+        "x-ocn": "11",
+        "web-device-id": dev,
+        "x-request-id": f"{dev}-{now_ms}-{_seq[0]}-",
+    }
+
+    data = None
+    if body is not None:
+        if encoding == JSON_BODY:
+            headers["Content-Type"] = "application/json;charset=UTF-8"
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        elif encoding == FORM_PAYLOAD:
+            headers["Content-Type"] = \
+                "application/x-www-form-urlencoded;charset=UTF-8"
+            inner = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            data = urllib.parse.urlencode({"payload": inner}).encode("utf-8")
+        else:  # FORM_FLAT
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = urllib.parse.urlencode(body).encode("utf-8")
+
+    if debug:
+        safe = dict(headers, Cookie="<redacted>")
+        print(f"--> {method} {url}\n    {safe}\n    {data!r}", file=sys.stderr)
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, status, rhdrs = r.read(), r.status, dict(r.headers)
+    except urllib.error.HTTPError as e:
+        raw, status, rhdrs = e.read(), e.code, dict(e.headers)
+    except urllib.error.URLError as e:
+        raise Net(f"cannot reach {url}: {e.reason}")
+
+    text = raw.decode("utf-8-sig", errors="replace")
+    if debug:
+        print(f"<-- {status} {text[:2000]}", file=sys.stderr)
+
+    if status in (401, 403) or "login/login" in text[:400]:
+        raise Auth("session cookie rejected or expired - log in again in the "
+                   "browser and refresh the cookie file")
+    try:
+        parsed = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        parsed = {"_raw": text}
+    return parsed, status, rhdrs
+
+
+def whoami(debug=False):
+    """Identity comes back in response headers on every call - no config needed.
+
+    x-user-no / x-user-domain / x-user-email are set by the server.
+    """
+    _, status, h = request("/p/oneapp/client/chat/getMessageUnreadCountByType",
+                           {"typeList": ["official", "teamroom", "normal"]},
+                           JSON_BODY, debug=debug)
+    low = {k.lower(): v for k, v in h.items()}
+    user_no, domain = low.get("x-user-no"), low.get("x-user-domain")
+    if not user_no or not domain:
+        raise Auth("server did not return identity headers; session likely dead")
+    return {"user_no": int(user_no), "domain_id": int(domain),
+            "email": low.get("x-user-email"), "status": status}
+
+
+class Auth(Exception): pass
+class Net(Exception): pass
+
+
+# ---------------------------------------------------------------- targets
+# A target list mixes people and group rooms. Which one an entry means changes
+# the endpoint it is sent to, so the kind is resolved and shown before any
+# send. Explicit beats guessed:
+#
+#     @Alice Chen        person
+#     #Project Kickoff   group room
+#     person:Bob Lee     person (long form)
+#     group:Sales        group room (long form)
+#     Carol              unprefixed -> auto, must resolve unambiguously
+#     u:abc-123          raw id, passed straight through (no lookup)
+#     c:9876             raw channel id, passed straight through
+
+PERSON, GROUP, AUTO = "person", "group", "auto"
+
+PREFIXES = [("@", PERSON), ("#", GROUP),
+            ("person:", PERSON), ("group:", GROUP),
+            ("u:", PERSON), ("c:", GROUP)]
+RAW_PREFIXES = ("u:", "c:")
+
+
+class Target:
+    __slots__ = ("raw", "kind", "name", "is_raw_id",
+                 "id", "display", "status", "candidates")
+
+    def __init__(self, raw, kind, name, is_raw_id=False):
+        self.raw, self.kind, self.name = raw, kind, name
+        self.is_raw_id = is_raw_id
+        self.id = self.display = None
+        self.status = "resolved" if is_raw_id else "pending"
+        self.candidates = []
+        if is_raw_id:
+            self.id, self.display = name, name
+
+    def as_dict(self):
+        return {"raw": self.raw, "kind": self.kind, "query": self.name,
+                "id": self.id, "display": self.display, "status": self.status,
+                "candidates": self.candidates or None}
+
+
+def parse_target(line):
+    """One line -> a Target, or None for blanks/comments.
+
+    '#' is overloaded: it marks a group room AND starts a comment. The rule is
+    whitespace - '# note' is a comment, '#Sales' is the room named Sales. Use
+    '//' for an unambiguous comment, and 'group:' to be explicit.
+    """
+    line = line.strip()
+    if not line or line.startswith("//") or line == "#":
+        return None
+    if line.startswith("# "):
+        return None
+    line = line.split(" //", 1)[0].strip()      # trailing comment
+    if not line:
+        return None
+    for pref, kind in PREFIXES:
+        if line.startswith(pref):
+            body = line[len(pref):].strip()
+            if not body:
+                return None
+            # '@12345' is not a name - a bare number is always a channelNo
+            return Target(line, kind, body,
+                          is_raw_id=pref in RAW_PREFIXES or body.isdigit())
+    return Target(line, AUTO, line, is_raw_id=line.isdigit())
+
+
+def parse_targets(path=None, inline=None):
+    targets, seen = [], set()
+
+    def add(t):
+        if t and (t.kind, t.name) not in seen:
+            seen.add((t.kind, t.name)); targets.append(t)
+
+    for chunk in inline or []:
+        for piece in chunk.split(","):
+            add(parse_target(piece))
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                add(parse_target(line))
+    return targets
+
+
+def load_directory(path):
+    """Optional local map, also a manual override for anything lookup misses.
+
+        {"people": {"Alice Chen": "u-123"}, "groups": {"Sales": "c-99"}}
+    """
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    return {"people": d.get("people", {}), "groups": d.get("groups", {})}
+
+
+def _match(table, query):
+    """Exact first, then case-insensitive substring. Returns list of (name,id)."""
+    if query in table:
+        return [(query, table[query])]
+    q = query.casefold()
+    exact_ci = [(n, i) for n, i in table.items() if n.casefold() == q]
+    if exact_ci:
+        return exact_ci
+    return [(n, i) for n, i in table.items() if q in n.casefold()]
+
+
+def resolve_targets(targets, directory=None, debug=False, by_id=None):
+    """Fill in id/display/status. Never guesses between two candidates."""
+    for t in targets:
+        if t.status == "resolved":
+            # a raw channelNo is valid but anonymous; name it if we can, so the
+            # dry-run shows WHICH room 123456789 actually is
+            if by_id and t.id and str(t.id) in by_id:
+                c = by_id[str(t.id)]
+                t.display = c["title"] or t.id
+                t.kind = c["kind"]
+            continue
+        tables = []
+        if directory:
+            if t.kind in (PERSON, AUTO):
+                tables.append((PERSON, directory["people"]))
+            if t.kind in (GROUP, AUTO):
+                tables.append((GROUP, directory["groups"]))
+        if not tables:
+            t.status = "unmapped"        # no lookup source available yet
+            continue
+
+        hits = []
+        for kind, table in tables:
+            hits += [(kind, n, i) for n, i in _match(table, t.name)]
+
+        if not hits:
+            t.status = "notfound"
+        elif len(hits) == 1:
+            kind, name, ident = hits[0]
+            t.kind, t.id, t.display, t.status = kind, ident, name, "resolved"
+        else:
+            t.status = "ambiguous"
+            t.candidates = [{"kind": k, "name": n, "id": i} for k, n, i in hits]
+    return targets
+
+
+def plan_summary(targets):
+    by = {"resolved": [], "ambiguous": [], "notfound": [], "unmapped": []}
+    for t in targets:
+        by[t.status].append(t)
+    return by
+
+
+def already_sent(key):
+    """Idempotency: a crash mid-broadcast must not double-send on rerun."""
+    try:
+        with open(SENTLOG, "r", encoding="utf-8") as f:
+            return any(json.loads(l).get("key") == key for l in f if l.strip())
+    except FileNotFoundError:
+        return False
+
+
+def record_sent(key, target, ts):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(SENTLOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "kind": target.kind, "id": target.id,
+                            "display": target.display, "at": ts},
+                           ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- commands
+def cmd_doctor(args):
+    problems, ident = [], None
+    perm = check_cookie_perms()
+    if perm:
+        problems.append(perm)
+    have = load_cookie() is not None
+    if not have:
+        problems.append(f"no cookie at {COOKIE_FILE} and LINEWORKS_COOKIE unset")
+    else:
+        try:
+            ident = whoami(args.debug)
+        except Auth as e:
+            problems.append(str(e))
+        except Net as e:
+            problems.append(str(e))
+    d = {"base": BASE, "cookie_file": COOKIE_FILE, "cookie_present": have,
+         "identity": ident, "problems": problems}
+    if problems:
+        return emit(err("; ".join(problems), EX_AUTH, **d), args.json)
+    return emit(ok(d), args.json,
+                human=f'ok - {ident["email"]} (userNo {ident["user_no"]}, '
+                      f'domain {ident["domain_id"]})')
+
+
+def cmd_whoami(args):
+    return emit(ok(whoami(args.debug)), args.json)
+
+
+def _walk_channels(node, out, depth=0):
+    """Response shape is unverified; find channel-ish dicts wherever they sit."""
+    if depth > 8:
+        return
+    if isinstance(node, dict):
+        if "channelNo" in node:
+            out.append(node)
+        for v in node.values():
+            _walk_channels(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_channels(v, out, depth + 1)
+
+
+# channelType, inferred from observed channels (not documented anywhere):
+CH_DIRECT, CH_SELF, CH_EXTERNAL = 1, 8, 10
+CHANNEL_KIND = {CH_DIRECT: PERSON, CH_SELF: "self"}
+
+
+def fetch_channels(ident, device_id, count=200, days=30, debug=False):
+    """syncUserChannelList is a DELTA SYNC, not a list call.
+
+    updateTime is 'changed since'. 0 is rejected (code 400 Invalid updateTime),
+    and anything past roughly 30-45 days is rejected too (code 2012 too old), so
+    walk back from the requested window until the server accepts one.
+    """
+    now_ms = int(time.time() * 1000)
+    attempts, data = [], None
+    for d in [days, 30, 21, 14, 7, 1]:
+        if d in attempts:
+            continue
+        attempts.append(d)
+        body = {"serviceId": "works",
+                "userKey": {"domainId": ident["domain_id"],
+                            "userNo": ident["user_no"]},
+                "filter": "none", "updatePaging": True, "pagingCount": count,
+                "userInfoCount": 8, "updateTime": now_ms - d * 86400 * 1000,
+                "beforeMsgTime": 0, "isPin": True, "requestAgain": False}
+        data, _, _ = request("/p/oneapp/client/chat/syncUserChannelList", body,
+                             JSON_BODY, debug=debug, device_id=device_id)
+        code = int(data.get("code", 0) or 0)
+        if code == 200:
+            break
+        if code != 2012:                      # not a window problem; give up
+            raise Net(f'syncUserChannelList: code {code} '
+                      f'{data.get("message") or ""}'.strip())
+        data = None
+    if data is None:
+        raise Net("no accepted updateTime window; server rejected every attempt")
+
+    found = []
+    _walk_channels(data, found)
+    chans, seen = [], set()
+    for c in found:
+        no = c.get("channelNo")
+        if no in seen or not c.get("joined", True):
+            continue
+        seen.add(no)
+        ctype = c.get("channelType")
+        users = c.get("userCount")
+        kind = CHANNEL_KIND.get(ctype, GROUP)
+        chans.append({"channelNo": no, "title": (c.get("title") or "").strip(),
+                      "member_count": users, "bot_count": c.get("botCount"),
+                      "channel_type": ctype, "external": ctype == CH_EXTERNAL,
+                      "kind": kind, "window_days": attempts[-1]})
+    chans.sort(key=lambda c: (-(c["member_count"] or 0), c["title"]))
+    return chans, data
+
+
+def cmd_channels(args):
+    ident = whoami(args.debug)
+    dev = _device_id(ident["user_no"])
+    chans, raw = fetch_channels(ident, dev, args.count, args.days, args.debug)
+    if args.raw:
+        return emit(ok(raw), args.json)
+    if not chans:
+        return emit(err("no channels in the sync window", EX_ERR, count=0),
+                    args.json)
+    rows = [f'{c["channelNo"]:<12} {c["kind"]:<6} t{c["channel_type"]:<3}'
+            f' {c["member_count"] or "?":>3}u'
+            f' {"EXT" if c["external"] else "   "}  {c["title"] or "(untitled)"}'
+            for c in chans]
+    note = (f'\n\n{len(chans)} channels active in the last '
+            f'{chans[0]["window_days"]}d - dormant ones are NOT listed')
+    return emit(ok({"channels": chans, "count": len(chans)}), args.json,
+                human="\n".join(rows) + note)
+
+
+def channel_directory(ident, device_id, debug=False):
+    """Build the name->id map the resolver needs, from existing channels."""
+    chans, _ = fetch_channels(ident, device_id, count=200, debug=debug)
+    by_id = {str(c["channelNo"]): c for c in chans}
+    people, groups = {}, {}
+    for c in chans:
+        if not c["title"] or c["kind"] == "self":
+            continue          # the memo-to-self room is not a broadcast target
+        (groups if c["kind"] == GROUP else people)[c["title"]] = c["channelNo"]
+    return {"people": people, "groups": groups, "_by_id": by_id}
+
+
+# messageTypeCode, observed live. 1 = typed text, 5 = bot/rich text; the 90s and
+# 100s are cards and membership events that carry their payload in `extras`.
+TEXT_TYPES = {1, 5}
+SYSTEM_TYPES = {101, 102}
+
+
+def fetch_messages(channel_no, count=50, since=0, debug=False, device_id=None):
+    """getChannelInfo doubles as the history read.
+
+    `messageNo` is an AFTER cursor (0 = most recent tail); `direction` appears
+    to be inert - all three values returned the same window.
+    """
+    data, _, _ = request("/p/oneapp/client/chat/getChannelInfo",
+                         {"channelNo": int(channel_no), "direction": 0,
+                          "messageNo": int(since),
+                          "recentMessageCount": int(count)},
+                         FORM_FLAT, debug=debug, device_id=device_id)
+    code = int(data.get("code", 0) or 0)
+    if code != 200:
+        raise Net(f'getChannelInfo: code {code} {data.get("message") or ""}'.strip())
+    recent = data.get("recentMessage") or {}
+    names = {str(w.get("userNo")): (w.get("name") or w.get("nickName"))
+             for w in (recent.get("writerMemberInfos") or [])}
+    out = []
+    for m in recent.get("messageList") or []:
+        who = m.get("userNo") or m.get("writerId")
+        tcode = m.get("messageTypeCode")
+        out.append({
+            "messageNo": m.get("messageNo"),
+            "time": m.get("createTime"),
+            "user_no": who,
+            "writer": names.get(str(who)) or (str(who) if who else None),
+            "type": tcode,
+            "is_text": tcode in TEXT_TYPES,
+            "is_system": tcode in SYSTEM_TYPES,
+            "content": m.get("content") or "",
+            "extras": m.get("extras") or "",
+        })
+    out.sort(key=lambda m: m["messageNo"] or 0)
+    return out, data
+
+
+def _fmt_time(ms):
+    if not ms:
+        return "?"
+    return _dt.datetime.fromtimestamp(ms / 1000).strftime("%m-%d %H:%M")
+
+
+def cmd_read(args):
+    ident = whoami(args.debug)
+    dev = _device_id(ident["user_no"])
+    targets, _ = _gather(args, ident, dev)
+    if len(targets) != 1:
+        return emit(err("read takes exactly one target", EX_USAGE), args.json)
+    t = targets[0]
+    if t.status != "resolved":
+        return emit(err(f"target did not resolve ({t.status}): {t.raw}",
+                        EX_USAGE, target=t.as_dict()), args.json)
+
+    since = args.since
+    seen_any = False
+    while True:
+        msgs, raw = fetch_messages(t.id, args.count, since, args.debug, dev)
+        if args.raw:
+            return emit(ok(raw), args.json)
+        shown = msgs if args.all else [m for m in msgs
+                                       if m["content"] and not m["is_system"]]
+        if args.json and not args.follow:
+            return emit(ok({"channel": t.display, "channelNo": t.id,
+                            "messages": shown, "count": len(shown)}), args.json)
+        for m in shown:
+            who = m["writer"] or "?"
+            tag = "" if m["is_text"] else f' [t{m["type"]}]'
+            print(f'{_fmt_time(m["time"])}  {who:<12}{tag} {m["content"]}')
+            seen_any = True
+        if not args.follow:
+            if not seen_any:
+                print(f'(no text messages; try --all)', file=sys.stderr)
+            return EX_OK
+        if msgs:
+            since = max(m["messageNo"] or 0 for m in msgs)
+        time.sleep(max(args.interval, 5))     # someone else's production service
+
+
+def send_one(channel_no, text, ident, device_id, debug=False):
+    tid = str(random.randint(100_000_000, 999_999_999))   # fresh per message
+    payload = {"serviceId": "works", "channelNo": int(channel_no),
+               "tempMessageId": tid,
+               "caller": {"domainId": ident["domain_id"],
+                          "userNo": ident["user_no"]},
+               "extras": "", "content": text, "msgTid": tid, "type": 1}
+    data, status, _ = request("/p/oneapp/client/chat/sendMessage", payload,
+                              FORM_PAYLOAD, debug=debug, device_id=device_id)
+    return data, status, tid
+
+
+def _gather(args, ident=None, device_id=None):
+    targets = parse_targets(args.to_file, args.to)
+    directory = load_directory(getattr(args, "directory", None))
+    if directory is None and ident is not None:
+        directory = channel_directory(ident, device_id, args.debug)
+    by_id = (directory or {}).get("_by_id")
+    return resolve_targets(targets, directory, args.debug, by_id), directory
+
+
+def _render_plan(by, text=None, delay=None):
+    out = []
+    if by["resolved"]:
+        out.append(f'will send to {len(by["resolved"])}:')
+        for t in by["resolved"]:
+            out.append(f'  [{t.kind:<6}] {t.display}  (channel {t.id})')
+    for label, hint in (("ambiguous", "matched more than one - qualify it"),
+                        ("notfound", "no open channel with that name"),
+                        ("unmapped", "no lookup source available")):
+        if by[label]:
+            out.append(f'\n{label} ({len(by[label])}) - {hint}:')
+            for t in by[label]:
+                extra = ""
+                if t.candidates:
+                    extra = "  -> " + ", ".join(f'{c["kind"]}:{c["name"]}'
+                                                for c in t.candidates[:5])
+                out.append(f'  {t.raw}{extra}')
+    if text is not None:
+        out.append(f'\n---\n{text}\n---')
+        if delay:
+            out.append(f'delay {delay}s between sends')
+    return "\n".join(out)
+
+
+def cmd_targets(args):
+    ident = dev = None
+    if not getattr(args, "directory", None):
+        ident = whoami(args.debug); dev = _device_id(ident["user_no"])
+    targets, _ = _gather(args, ident, dev)
+    if not targets:
+        return emit(err("no targets; use --to or --to-file", EX_USAGE), args.json)
+    by = plan_summary(targets)
+    return emit(ok({"targets": [t.as_dict() for t in targets],
+                    "counts": {k: len(v) for k, v in by.items()}}),
+                args.json, human=_render_plan(by))
+
+
+def cmd_send(args):
+    if not args.message and not args.message_file:
+        return emit(err("no message; use --message or --message-file", EX_USAGE),
+                    args.json)
+    text = args.message
+    if args.message_file:
+        with open(args.message_file, "r", encoding="utf-8") as f:
+            text = f.read().rstrip("\n")
+
+    ident = whoami(args.debug)
+    dev = _device_id(ident["user_no"])
+    targets, _ = _gather(args, ident, dev)
+    if not targets:
+        return emit(err("no targets; use --to or --to-file", EX_USAGE), args.json)
+
+    by = plan_summary(targets)
+    bad = by["ambiguous"] + by["notfound"] + by["unmapped"]
+    payload = {"counts": {k: len(v) for k, v in by.items()},
+               "targets": [t.as_dict() for t in targets], "message": text,
+               "delay_s": args.delay, "tag": args.tag, "sender": ident["email"]}
+
+    if args.dry_run:
+        return emit(ok(dict(payload, dry_run=True)), args.json,
+                    human="[dry-run] " + _render_plan(by, text, args.delay))
+    if bad and not args.skip_unresolved:
+        detail = _render_plan(by)
+        return emit(err(f"{len(bad)} of {len(targets)} targets did not resolve; "
+                        f"fix them, or pass --skip-unresolved to send to the "
+                        f"{len(by['resolved'])} that did\n\n{detail}",
+                        EX_USAGE, **payload), args.json)
+    if not by["resolved"]:
+        return emit(err("nothing resolved to send to", EX_USAGE, **payload),
+                    args.json)
+    if not args.yes:
+        n = len(by["resolved"])
+        g = sum(1 for t in by["resolved"] if t.kind == GROUP)
+        return emit(err(f"refusing to send to {n} targets "
+                        f"({n - g} people, {g} groups) as {ident['email']} "
+                        f"without --yes", EX_USAGE, **payload), args.json)
+
+    sent, skipped, failed = [], [], []
+    total = len(by["resolved"])
+    for i, t in enumerate(by["resolved"]):
+        key = f'{args.tag}:{t.id}' if args.tag else None
+        if key and already_sent(key):
+            skipped.append(t.as_dict()); continue
+        try:
+            data, status, tid = send_one(t.id, text, ident, dev, args.debug)
+        except (Net, Auth) as e:
+            failed.append(dict(t.as_dict(), error=str(e)))
+            if isinstance(e, Auth):
+                break          # session died; stop rather than hammer
+            continue
+        good = status == 200 and int(data.get("code", 200) or 200) == 200
+        if good:
+            if key:
+                record_sent(key, t, int(time.time()))
+            sent.append(dict(t.as_dict(), tempMessageId=tid))
+        else:
+            failed.append(dict(t.as_dict(), status=status, response=data))
+        if not args.json:
+            print(f'[{i+1}/{total}] {"ok " if good else "FAIL"} {t.display}',
+                  file=sys.stderr)
+        if i < total - 1 and args.delay:
+            time.sleep(args.delay)
+
+    res = {"sent": sent, "skipped": skipped, "failed": failed,
+           "counts": {"sent": len(sent), "skipped": len(skipped),
+                      "failed": len(failed)}, "sender": ident["email"]}
+    if failed:
+        return emit(err(f'{len(failed)} of {total} failed', EX_ERR, **res),
+                    args.json)
+    return emit(ok(res), args.json,
+                human=f'sent to {len(sent)}'
+                      + (f', skipped {len(skipped)} already-sent' if skipped else ''))
+
+
+def cmd_raw(args):
+    body = None
+    if args.data:
+        raw = sys.stdin.read() if args.data == "-" else args.data
+        body = json.loads(raw)
+    enc = {"json": JSON_BODY, "payload": FORM_PAYLOAD, "form": FORM_FLAT}[args.enc]
+    ident = whoami(args.debug)
+    data, status, _ = request(args.path, body, enc, args.method.upper(),
+                              args.debug, device_id=_device_id(ident["user_no"]))
+    return emit(ok({"status": status, "body": data}), args.json)
+
+
+# -------------------------------------------------------------------- main
+def build_parser():
+    # global flags live on a parent so they work before OR after the subcommand
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true",
+                        help="machine-readable envelope")
+    common.add_argument("--debug", action="store_true",
+                        help="dump req/resp to stderr")
+
+    p = argparse.ArgumentParser(prog="lineworks", description=__doc__,
+                                parents=[common],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("doctor", parents=[common],
+                       help="connectivity + cookie check")
+    d.set_defaults(fn=cmd_doctor)
+
+    tgt_flags = argparse.ArgumentParser(add_help=False)
+    tgt_flags.add_argument("--to", action="append",
+                           help="target (repeatable, comma-ok): @person #group")
+    tgt_flags.add_argument("--to-file", help="target list, one per line")
+    tgt_flags.add_argument("--directory",
+                           help="JSON name->id map; also a manual override")
+
+    t = sub.add_parser("targets", parents=[common, tgt_flags],
+                       help="resolve a target list without sending")
+    t.set_defaults(fn=cmd_targets)
+
+    s = sub.add_parser("send", parents=[common, tgt_flags],
+                       help="send one message to many targets")
+    s.add_argument("--message", "-m")
+    s.add_argument("--message-file")
+    s.add_argument("--delay", type=float, default=3.0,
+                   help="seconds between sends (default 3; keep it human)")
+    s.add_argument("--tag", help="idempotency tag; reruns skip already-sent")
+    s.add_argument("--dry-run", action="store_true",
+                   help="resolve and print the plan, send nothing")
+    s.add_argument("--skip-unresolved", action="store_true",
+                   help="send to what resolved instead of refusing")
+    s.add_argument("--yes", action="store_true", help="actually send")
+    s.set_defaults(fn=cmd_send)
+
+    rd = sub.add_parser("read", parents=[common, tgt_flags],
+                        help="read a channel's messages")
+    rd.add_argument("--count", type=int, default=50)
+    rd.add_argument("--since", type=int, default=0,
+                    help="only messages after this messageNo")
+    rd.add_argument("--all", action="store_true",
+                    help="include system events and empty/rich messages")
+    rd.add_argument("--follow", "-f", action="store_true", help="poll for new")
+    rd.add_argument("--interval", type=float, default=15.0)
+    rd.add_argument("--raw", action="store_true")
+    rd.set_defaults(fn=cmd_read)
+
+    w = sub.add_parser("whoami", parents=[common], help="identity from the session")
+    w.set_defaults(fn=cmd_whoami)
+
+    c = sub.add_parser("channels", parents=[common],
+                       help="list open channels - these are the send targets")
+    c.add_argument("--count", type=int, default=200)
+    c.add_argument("--days", type=int, default=30,
+                   help="sync window; server rejects much past ~30-45")
+    c.add_argument("--raw", action="store_true", help="unparsed response")
+    c.set_defaults(fn=cmd_channels)
+
+    r = sub.add_parser("raw", parents=[common],
+                       help="call any endpoint with auth attached")
+    r.add_argument("method"); r.add_argument("path")
+    r.add_argument("--data", help="JSON body, or - for stdin")
+    r.add_argument("--enc", choices=["json", "payload", "form"], default="json",
+                   help="body encoding (this API uses all three)")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argv)
+    # a flag given before the subcommand is overwritten by the child default,
+    # so OR in what we saw on the raw argv
+    args.json = args.json or "--json" in argv
+    args.debug = args.debug or "--debug" in argv
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except FileNotFoundError as e:
+        return emit(err(f"no such file: {e.filename}", EX_USAGE), args.json)
+    except KeyboardInterrupt:
+        return emit(err("interrupted", EX_ERR), args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
