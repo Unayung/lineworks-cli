@@ -531,12 +531,54 @@ def classify_member(m, my_domain):
     return "works-ext"
 
 
-def fetch_channels(ident, device_id, count=200, days=30, debug=False):
-    """syncUserChannelList is a DELTA SYNC, not a list call.
+def _norm_channel(c, group=None, window=None):
+    extras = _channel_extras(c)
+    origin = _channel_origin(extras)
+    ctype = c.get("channelType")
+    return {"channelNo": c.get("channelNo"),
+            "title": (c.get("title") or "").strip(),
+            "member_count": c.get("userCount"), "bot_count": c.get("botCount"),
+            "channel_type": ctype, "external": ctype == CH_EXTERNAL,
+            "origin": origin, "has_line_users": origin == ORIGIN_LINE,
+            "kind": CHANNEL_KIND.get(ctype, GROUP),
+            "group": group, "window_days": window}
 
-    updateTime is 'changed since'. 0 is rejected (code 400 Invalid updateTime),
-    and anything past roughly 30-45 days is rejected too (code 2012 too old), so
-    walk back from the requested window until the server accepts one.
+
+def fetch_channels_full(ident, device_id, count=500, debug=False):
+    """getUserChannelListByType - the COMPLETE channel list.
+
+    Not a delta, so dormant rooms appear. Arrives grouped: normal / official /
+    teamroom. An empty body is rejected (code 400 Key:pagingCount).
+    """
+    body = {"serviceId": "works",
+            "userKey": {"domainId": ident["domain_id"],
+                        "userNo": ident["user_no"]},
+            "pagingCount": count}
+    data, _, _ = request("/p/oneapp/client/chat/getUserChannelListByType",
+                         body, JSON_BODY, debug=debug, device_id=device_id)
+    code = int(data.get("code", 0) or 0)
+    if code != 200:
+        raise Net(f'getUserChannelListByType: code {code} '
+                  f'{data.get("message") or ""}'.strip())
+    chans, seen = [], set()
+    for group, blob in (data.get("result") or {}).items():
+        for c in (blob or {}).get("channelList") or []:
+            no = c.get("channelNo")
+            if no in seen or not c.get("joined", True):
+                continue
+            seen.add(no)
+            chans.append(_norm_channel(c, group=group))
+    chans.sort(key=lambda c: (-(c["member_count"] or 0), c["title"]))
+    return chans, data
+
+
+def fetch_channels_sync(ident, device_id, count=200, days=30, debug=False):
+    """syncUserChannelList - a DELTA SYNC, kept only as a fallback.
+
+    updateTime is 'changed since': 0 is rejected (code 400) and much past
+    ~30-45 days is rejected (code 2012), so walk the window back until one is
+    accepted. Dormant channels never appear, which is why the full list above
+    is preferred.
     """
     now_ms = int(time.time() * 1000)
     attempts, data = [], None
@@ -555,13 +597,12 @@ def fetch_channels(ident, device_id, count=200, days=30, debug=False):
         code = int(data.get("code", 0) or 0)
         if code == 200:
             break
-        if code != 2012:                      # not a window problem; give up
+        if code != 2012:
             raise Net(f'syncUserChannelList: code {code} '
                       f'{data.get("message") or ""}'.strip())
         data = None
     if data is None:
-        raise Net("no accepted updateTime window; server rejected every attempt")
-
+        raise Net("no accepted updateTime window")
     found = []
     _walk_channels(data, found)
     chans, seen = [], set()
@@ -570,51 +611,65 @@ def fetch_channels(ident, device_id, count=200, days=30, debug=False):
         if no in seen or not c.get("joined", True):
             continue
         seen.add(no)
-        ctype = c.get("channelType")
-        users = c.get("userCount")
-        kind = CHANNEL_KIND.get(ctype, GROUP)
-        extras = _channel_extras(c)
-        origin = _channel_origin(extras)
-        chans.append({"channelNo": no, "title": (c.get("title") or "").strip(),
-                      "member_count": users, "bot_count": c.get("botCount"),
-                      "channel_type": ctype, "external": ctype == CH_EXTERNAL,
-                      "origin": origin, "has_line_users": origin == ORIGIN_LINE,
-                      "kind": kind, "window_days": attempts[-1]})
+        chans.append(_norm_channel(c, window=attempts[-1]))
     chans.sort(key=lambda c: (-(c["member_count"] or 0), c["title"]))
     return chans, data
 
 
-def channel_members(channel_no, my_domain, sample=100, debug=False,
-                    device_id=None):
-    """Classify who has SPOKEN in a channel - this is a sample, not a roster.
+def fetch_channels(ident, device_id, count=500, days=30, debug=False,
+                   sync=False):
+    if not sync:
+        try:
+            return fetch_channels_full(ident, device_id, count, debug)
+        except Net:
+            pass                      # fall back to the delta sync
+    return fetch_channels_sync(ident, device_id, min(count, 200), days, debug)
 
-    There is no roster endpoint: `userList` stays empty for group channels
-    whatever `userInfoCount` is set to, and `readInfos` carries userNos with no
-    domainId to classify by. So identities come from writerMemberInfos over a
-    window of messages, and a lurker who never posted will not appear.
+
+def channel_members(channel_no, my_domain, sample=None, debug=False,
+                    device_id=None):
+    """getChannelMembers - the REAL roster, silent members included.
+
+    Pages 500 at a time: when a page comes back full, re-request passing the
+    returned nextMemberUpdateTime as memberUpdateTime.
     """
-    data, _, _ = request("/p/oneapp/client/chat/getChannelInfo",
-                         {"channelNo": int(channel_no), "direction": 0,
-                          "messageNo": 0, "recentMessageCount": int(sample)},
-                         FORM_FLAT, debug=debug, device_id=device_id)
-    roster = len(data.get("readInfos") or [])
-    seen, out = set(), []
-    for m in (data.get("recentMessage") or {}).get("writerMemberInfos") or []:
-        u = m.get("userNo")
-        if u in seen:
-            continue
-        seen.add(u)
-        out.append({"userNo": u, "name": m.get("name"),
-                    "domainId": m.get("domainId"),
-                    "domain": m.get("domainName") or None,
-                    "origin": classify_member(m, my_domain)})
-    return {"observed": out, "roster_size": roster}
+    out, seen, cursor = [], set(), None
+    for _ in range(20):                       # hard stop on runaway paging
+        body = {"channelNo": int(channel_no), "pagingCount": 500}
+        if cursor:
+            body["memberUpdateTime"] = cursor
+        data, _, _ = request("/p/oneapp/client/chat/getChannelMembers", body,
+                             JSON_BODY, debug=debug, device_id=device_id)
+        code = int(data.get("code", 0) or 0)
+        if code != 200:
+            raise Net(f'getChannelMembers: code {code} '
+                      f'{data.get("message") or ""}'.strip())
+        page = data.get("members") or []
+        for m in page:
+            u = m.get("userNo")
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append({"userNo": u, "name": m.get("name"),
+                        "domainId": m.get("domainId"),
+                        "domain": m.get("domainName") or None,
+                        "joined": m.get("join"), "guest": bool(m.get("guest")),
+                        "origin": classify_member(m, my_domain)})
+        cursor = data.get("nextMemberUpdateTime")
+        if len(page) < 500 or not cursor:
+            break
+    # the roster includes people who have LEFT (join:false); counting them
+    # inflates the room. join:true matches the channel list's userCount exactly.
+    current = [m for m in out if m["joined"]]
+    return {"observed": current, "departed": [m for m in out if not m["joined"]],
+            "roster_size": len(current), "is_roster": True}
 
 
 def cmd_channels(args):
     ident = whoami(args.debug)
     dev = _device_id(ident["user_no"])
-    chans, raw = fetch_channels(ident, dev, args.count, args.days, args.debug)
+    chans, raw = fetch_channels(ident, dev, args.count, args.days, args.debug,
+                                sync=args.sync)
     if args.raw:
         return emit(ok(raw), args.json)
     if not chans:
@@ -643,12 +698,16 @@ def cmd_channels(args):
             n = {}
             for m in mem["observed"]:
                 n[m["origin"]] = n.get(m["origin"], 0) + 1
-            got, tot = len(mem["observed"]), c["member_count"] or "?"
-            row += (f'  [spoke {got}/{tot}: '
-                    + ", ".join(f"{k} {v}" for k, v in sorted(n.items())) + "]")
+            got = len(mem["observed"])
+            left = len(mem.get("departed") or [])
+            row += (f'  [{got} members: '
+                    + ", ".join(f"{k} {v}" for k, v in sorted(n.items()))
+                    + (f'; {left} left' if left else "") + "]")
         rows.append(row)
-    note = (f'\n\n{len(chans)} channels active in the last '
-            f'{chans[0]["window_days"]}d - dormant ones are NOT listed')
+    w = chans[0]["window_days"]
+    note = (f'\n\n{len(chans)} channels'
+            + (f' active in the last {w}d - dormant ones are NOT listed'
+               if w else ' (complete list)'))
     return emit(ok({"channels": chans, "count": len(chans)}), args.json,
                 human="\n".join(rows) + note)
 
@@ -1208,9 +1267,11 @@ def build_parser():
 
     c = sub.add_parser("channels", parents=[common],
                        help="list open channels - these are the send targets")
-    c.add_argument("--count", type=int, default=200)
+    c.add_argument("--count", type=int, default=500)
     c.add_argument("--days", type=int, default=30,
-                   help="sync window; server rejects much past ~30-45")
+                   help="delta-sync window; only used with --sync")
+    c.add_argument("--sync", action="store_true",
+                   help="use the delta-sync endpoint instead of the full list")
     c.add_argument("--raw", action="store_true", help="unparsed response")
     c.add_argument("--members", action="store_true",
                    help="classify who has SPOKEN (sample, not a roster; "

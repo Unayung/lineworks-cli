@@ -86,31 +86,47 @@ lineworks channels --members          # classify who has SPOKEN per channel
 lineworks channels --members --sample 200
 ```
 
-**`--members` is a sample, not a roster.** No *channel* roster is reachable:
-`userList` stays empty for group channels whatever `userInfoCount` is set to,
-and `readInfos` gives userNos with no domainId to classify by. Identities come
-from writers over a window of messages, so a lurker who never posted will not
-appear - hence the `spoke 4/16` framing. It costs one request per channel.
+**`--members` is a real roster.** `getChannelMembers` returns actual membership
+including silent members, so external LINE users are classified properly:
 
-(A *domain* roster does exist - see **Contacts** below - but it covers only
-internal colleagues, so it cannot classify a channel's external members.)
+```
+POST /p/oneapp/client/chat/getChannelMembers
+{"channelNo": N, "pagingCount": 500, "memberUpdateTime": <cursor>}
+-> {"members": [...], "nextMemberUpdateTime": ...}
+```
+
+- Pages 500 at a time; a full page means re-request with
+  `nextMemberUpdateTime` as `memberUpdateTime`.
+- **The roster includes people who have LEFT** (`join: false`). Counting them
+  inflates the room - filtering to `join: true` matches the channel list's
+  `userCount` exactly. The CLI reports current members and notes departures
+  separately (`20 members: internal 3, line 17; 3 left`).
+- One request per channel, so `--members` is opt-in.
 
 Note that in a LINE-connected room **your own userNo is a per-service alias**,
 not the `userNo` that `whoami` reports.
 
-**Two hard limits on who you can reach:**
-
-1. **A channel must already exist.** Someone never messaged has no `channelNo`
-   and resolves `notfound`. Open the chat once in the web UI, then re-run.
-2. **`channels` only sees the last ~30 days.** The underlying call is a delta
-   sync, so a dormant room is invisible even though it exists. Post in it, or
-   pin its `channelNo` via `--directory`.
+**One hard limit:** a channel must already exist. Someone never messaged has no
+`channelNo` and resolves `notfound`. Open the chat once in the web UI, then
+re-run.
 
 ```bash
-lineworks channels                 # active channels = the target list
-lineworks channels --days 14       # narrower window
-lineworks channels --raw --json    # unparsed response
+lineworks channels                 # COMPLETE list, dormant rooms included
+lineworks channels --members       # real roster per channel (1 request each)
+lineworks channels --sync          # delta-sync fallback (~30d window)
+lineworks channels --raw --json
 ```
+
+`channels` uses `getUserChannelListByType`, which returns **every** channel,
+grouped `normal` / `official` / `teamroom`. It needs `pagingCount` in the body -
+an empty body is rejected with `code 400 Key:pagingCount`.
+
+`--sync` is the older `syncUserChannelList` path, kept as a fallback. It is a
+**delta sync**: `updateTime` means "changed since", `0` is rejected (`code 400`)
+and much past ~30-45 days is rejected (`code 2012`), so the CLI walks the window
+back until one is accepted. **It silently omits dormant rooms** - on this tenant
+it returned 14 channels where the full list returns 24, hiding three
+LINE-connected external rooms. Do not use it to build a broadcast list.
 
 ## Target lists
 
@@ -359,9 +375,7 @@ Endpoints visible in the bundle but **not yet implemented** here:
 
 | endpoint | why it matters |
 |---|---|
-| `/client/chat/getChannelMembers` | a real channel roster - would replace the `--members` sampling |
-| `/client/chat/getVisibleUserChannelList` | likely a full channel list without the ~30-day sync window |
-| `/client/chat/getUserChannelListByType` | channels filtered by type |
+| `/client/chat/getVisibleUserChannelList` | another channel list; returned 0 rows for every body tried |
 | `/client/chat/getMessageListByNoList` | fetch specific messages by number |
 | `message/sendMulti` | referenced as a 1-by-1 multi-send link |
 
