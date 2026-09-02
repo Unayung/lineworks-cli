@@ -62,6 +62,35 @@ lineworks whoami      # userNo / domainId / email
 `x-user-domain` and `x-user-email` response headers on every call; `whoami`
 reads them. Never print the cookie, never ask the user to paste it into chat.
 
+## Profiles (multiple identities)
+
+One machine, several real people: each identity is a directory holding its own
+`cookie`, `device` and `sent.jsonl`:
+
+```
+~/.config/lineworks/profiles/<name>/cookie   # mode 0600, one per person
+```
+
+Select with `--profile <name>` or `LINEWORKS_PROFILE=<name>` (flag wins).
+`doctor` prints `ok [<name>] - email...`; send plans and `--json` envelopes
+carry a `profile` field, so logs show who acted.
+
+**Once `profiles/` exists there is NO default identity.** Any command without
+a profile exits `3` with "pick an identity" - deliberate, so an agent can
+never fall back to the wrong person. The pre-profiles single-user layout
+(`~/.config/lineworks/cookie`) keeps working as long as `profiles/` does not
+exist. `LINEWORKS_COOKIE` still overrides everything - an explicit credential
+is an explicit identity choice.
+
+Rules when driving this as an agent:
+
+- Set `LINEWORKS_PROFILE` once for the whole session/process; do not pass
+  different `--profile` values within one task.
+- Before the first `send` under a profile, run `doctor` and confirm the
+  reported email is the person you are supposed to be acting as.
+- Profile names are one path segment (`/` and leading `.` rejected, exit `2`).
+- Migration is just `mkdir -p` + move the three files; nothing else changes.
+
 ## Everything is a channel
 
 There is no separate person-vs-group endpoint. A 1:1 chat and a group room are

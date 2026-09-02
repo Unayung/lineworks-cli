@@ -36,7 +36,32 @@ import urllib.request
 
 BASE = "https://talk.worksmobile.com"
 CONTACT_BASE = "https://contact.worksmobile.com"   # separate service, own auth
-CONFIG_DIR = os.path.expanduser("~/.config/lineworks")
+PROFILES_ROOT = os.path.expanduser("~/.config/lineworks/profiles")
+
+
+def _profile_from_argv():
+    """--profile must steer CONFIG_DIR, which is read at import time - long
+    before argparse runs - so pull it straight off argv, same trick main()
+    uses for --json."""
+    av = sys.argv[1:]
+    for i, a in enumerate(av):
+        if a == "--profile" and i + 1 < len(av):
+            return av[i + 1]
+        if a.startswith("--profile="):
+            return a.split("=", 1)[1]
+    return None
+
+
+PROFILE = _profile_from_argv() or os.environ.get("LINEWORKS_PROFILE") or None
+if PROFILE and ("/" in PROFILE or PROFILE.startswith(".")):
+    print(f"bad profile name: {PROFILE!r}", file=sys.stderr)
+    sys.exit(2)
+# An existing profiles/ dir makes the profile mandatory: with several real
+# identities on one machine, silently falling back to a default is how an
+# agent ends up sending as the wrong person.
+PROFILE_REQUIRED = PROFILE is None and os.path.isdir(PROFILES_ROOT)
+CONFIG_DIR = (os.path.join(PROFILES_ROOT, PROFILE) if PROFILE
+              else os.path.expanduser("~/.config/lineworks"))
 COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
 SENTLOG = os.path.join(CONFIG_DIR, "sent.jsonl")
 
@@ -72,7 +97,11 @@ def load_cookie():
     """Cookie from env, else ~/.config/lineworks/cookie. Never printed."""
     env = os.environ.get("LINEWORKS_COOKIE")
     if env:
-        return env.strip()
+        return env.strip()  # explicit credential = explicit identity choice
+    if PROFILE_REQUIRED:
+        raise Auth(f"{PROFILES_ROOT} exists; pick an identity with "
+                   f"--profile <name> or LINEWORKS_PROFILE "
+                   f"(no default when profiles exist)")
     try:
         with open(COOKIE_FILE, "r", encoding="utf-8") as f:
             c = f.read().strip()
@@ -473,12 +502,13 @@ def cmd_doctor(args):
             problems.append(str(e))
         except Net as e:
             problems.append(str(e))
-    d = {"base": BASE, "cookie_file": COOKIE_FILE, "cookie_present": have,
-         "identity": ident, "problems": problems}
+    d = {"base": BASE, "profile": PROFILE, "cookie_file": COOKIE_FILE,
+         "cookie_present": have, "identity": ident, "problems": problems}
     if problems:
         return emit(err("; ".join(problems), EX_AUTH, **d), args.json)
     return emit(ok(d), args.json,
-                human=f'ok - {ident["email"]} (userNo {ident["user_no"]}, '
+                human=f'ok{f" [{PROFILE}]" if PROFILE else ""} - '
+                      f'{ident["email"]} (userNo {ident["user_no"]}, '
                       f'domain {ident["domain_id"]})')
 
 
@@ -1115,7 +1145,8 @@ def cmd_send(args):
     bad = by["ambiguous"] + by["notfound"] + by["unmapped"]
     payload = {"counts": {k: len(v) for k, v in by.items()},
                "targets": [t.as_dict() for t in targets], "message": text,
-               "delay_s": args.delay, "tag": args.tag, "sender": ident["email"]}
+               "delay_s": args.delay, "tag": args.tag, "sender": ident["email"],
+               "profile": PROFILE}
 
     if args.dry_run:
         return emit(ok(dict(payload, dry_run=True)), args.json,
@@ -1207,6 +1238,10 @@ def build_parser():
                         help="machine-readable envelope")
     common.add_argument("--debug", action="store_true",
                         help="dump req/resp to stderr")
+    common.add_argument("--profile",
+                        help="identity dir ~/.config/lineworks/profiles/<name>/ "
+                             "(or LINEWORKS_PROFILE); mandatory once profiles/ "
+                             "exists")
 
     p = argparse.ArgumentParser(prog="lineworks", description=__doc__,
                                 parents=[common],
