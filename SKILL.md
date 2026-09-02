@@ -62,6 +62,34 @@ lineworks whoami      # userNo / domainId / email
 `x-user-domain` and `x-user-email` response headers on every call; `whoami`
 reads them. Never print the cookie, never ask the user to paste it into chat.
 
+### Getting the cookie (walk a non-technical user through this)
+
+On exit `3` (no cookie, or expired), relay these steps in the user's language,
+one at a time:
+
+1. Open `https://talk.worksmobile.com` in Chrome/Edge and log in as usual.
+2. Press **F12** (or right-click the page → 檢查/Inspect) → **Network** tab.
+3. Click any chat room so new rows appear; click any row whose name looks like
+   an API call (e.g. `getUserChannelListByType`).
+4. In the right panel find **Request Headers → `cookie`**, click its value,
+   select all, copy. It is one very long line - that is normal. (It must come
+   from here: the cookie is `HttpOnly`, so `document.cookie` shows nothing,
+   and DevTools HAR exports strip it.)
+5. Have them run ONE command in their own terminal to land the clipboard in
+   the file - the cookie itself must never pass through the chat:
+
+   ```bash
+   mkdir -p ~/.config/lineworks && umask 077 &&      pbpaste > ~/.config/lineworks/cookie        # macOS
+     wl-paste > ~/.config/lineworks/cookie       # Linux/Wayland (xclip -o for X11)
+   ```
+
+   For a profile, the path is `~/.config/lineworks/profiles/<name>/cookie`.
+6. Verify with `lineworks doctor` (add `--profile <name>` if applicable) and
+   read the email back to them so they confirm it is their own account.
+
+The cookie lasts until the web session expires or they log out in that
+browser; expiry just means repeating these steps.
+
 ## Profiles (multiple identities)
 
 One machine, several real people: each identity is a directory holding its own
